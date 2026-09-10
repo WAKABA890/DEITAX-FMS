@@ -1,0 +1,162 @@
+@import "tailwindcss";
+
+/* DT-FMS Modern is the single supported palette. Dark and light modes retain
+   their independent, deliberately curated values. */
+:root,
+:root[data-fms-mode="dark"] {
+  --fms-bg: #1d1a18; --fms-surface: #25211f; --fms-surface-raised: #2d2825; --fms-surface-overlay: rgba(24, 21, 19, .82); --fms-card: #2a2522;
+  --fms-border: #443c37; --fms-border-strong: #61554d; --fms-text: #f5f1ec; --fms-text-secondary: #d8d0c8; --fms-text-muted: #ada39a; --fms-text-inverse: #231f1b;
+  --fms-primary: #eab308; --fms-primary-hover: #facc15; --fms-primary-active: #ca8a04; --fms-secondary: #eab308; --fms-success: #22c55e; --fms-warning: #facc15; --fms-danger: #fb4f70; --fms-info: #60a5fa;
+  --fms-input-bg: #211e1c; --fms-input-border: #61554d; --fms-input-focus: #facc15; --fms-sidebar-bg: #211e1d; --fms-sidebar-border: #443c37; --fms-sidebar-active-bg: #4a3716; --fms-sidebar-active-text: #facc15;
+  --fms-table-header: #25211f; --fms-table-row: #2a2522; --fms-table-row-hover: #37302c; --fms-overlay: rgba(24, 21, 19, .64); --fms-shadow: rgba(0, 0, 0, .48);
+}
+
+/* Readable status backgrounds remain semantic in every palette/mode. */
+:root { --fms-success-bg: color-mix(in srgb, var(--fms-success) 16%, transparent); --fms-warning-bg: color-mix(in srgb, var(--fms-warning) 16%, transparent); --fms-danger-bg: color-mix(in srgb, var(--fms-danger) 16%, transparent); --fms-info-bg: color-mix(in srgb, var(--fms-info) 16%, transparent); }
+
+:root[data-fms-mode="light"] {
+  /* Modern reference: clean pale-grey workspace, white cards and the same
+     gold accent system as the supplied Modern Light screen. */
+  --fms-bg: #f4f4f7; --fms-surface: #ffffff; --fms-surface-raised: #f8f8fa; --fms-surface-overlay: rgba(255, 255, 255, .68); --fms-card: #ffffff;
+  --fms-border: #dfdcd9; --fms-border-strong: #b7b0aa; --fms-text: #2b2928; --fms-text-secondary: #5f5a56; --fms-text-muted: #7d7670; --fms-text-inverse: #231f1b;
+  --fms-primary: #eab308; --fms-primary-hover: #facc15; --fms-primary-active: #ca8a04; --fms-secondary: #eab308; --fms-success: #16a34a; --fms-warning: #d99b00; --fms-danger: #e11d48; --fms-info: #4f7fd8;
+  --fms-input-bg: #ffffff; --fms-input-border: #c3bcb6; --fms-input-focus: #eab308; --fms-sidebar-bg: #ecebe9; --fms-sidebar-border: #dfdcd9; --fms-sidebar-active-bg: #eee2be; --fms-sidebar-active-text: #b77900;
+  --fms-table-header: #f0efed; --fms-table-row: #ffffff; --fms-table-row-hover: #f6f1e3; --fms-overlay: rgba(255, 255, 255, .58); --fms-shadow: rgba(43, 41, 40, .14);
+}
+
+html { background: var(--fms-bg); }
+body { margin: 0; min-height: 100vh; background: var(--fms-bg); color: var(--fms-text); font-family: Inter, "Segoe UI", sans-serif; }
+#root { min-height: 100vh; }
+
+/* Shared semantic primitives for all new/refactored application UI. */
+.fms-app-shell { background: radial-gradient(circle at top left, color-mix(in srgb, var(--fms-secondary) 14%, transparent), transparent 32%), var(--fms-bg); color: var(--fms-text); }
+@media (min-width: 1024px) { html[data-document-preview-open] .fms-app-shell { padding-right: calc(80mm + 1.25rem); } }
+.fms-surface { background: var(--fms-surface); border-color: var(--fms-border); color: var(--fms-text); }
+.fms-card { background: var(--fms-card); border-color: var(--fms-border); color: var(--fms-text); box-shadow: 0 16px 40px var(--fms-shadow); }
+.fms-text-secondary { color: var(--fms-text-secondary); }
+.fms-brand-strip { background: linear-gradient(90deg, var(--fms-primary), var(--fms-secondary), var(--fms-primary)); }
+.fms-input { background: var(--fms-input-bg); border: 1px solid var(--fms-input-border); color: var(--fms-text); border-radius: .75rem; min-height: 2.5rem; }
+.fms-input::placeholder { color: var(--fms-text-muted); }.fms-input:focus { outline: none; border-color: var(--fms-input-focus); box-shadow: 0 0 0 3px color-mix(in srgb, var(--fms-input-focus) 18%, transparent); }
+.fms-btn { display: inline-flex; min-height: 2.5rem; align-items: center; justify-content: center; gap: .5rem; border-radius: .75rem; padding: .5rem 1rem; font-size: .75rem; font-weight: 700; transition: background-color .15s, border-color .15s, color .15s, box-shadow .15s, transform .15s; }.fms-btn:focus-visible, button:focus-visible { outline: 2px solid var(--fms-input-focus); outline-offset: 2px; }.fms-btn:active { transform: translateY(1px); }.fms-btn:disabled, button:disabled { cursor: not-allowed; opacity: .55; filter: grayscale(.2); }
+.fms-btn-primary { background: var(--fms-primary); color: var(--fms-text-inverse); box-shadow: 0 6px 16px color-mix(in srgb, var(--fms-primary) 28%, transparent); }.fms-btn-primary:hover:not(:disabled) { background: var(--fms-primary-hover); box-shadow: 0 8px 20px color-mix(in srgb, var(--fms-primary) 38%, transparent); }.fms-btn-danger { background: var(--fms-danger); color: var(--fms-text-inverse); box-shadow: 0 6px 16px color-mix(in srgb, var(--fms-danger) 24%, transparent); }.fms-btn-danger:hover:not(:disabled) { filter: brightness(1.08); }.fms-btn-secondary { background: var(--fms-surface-raised); border: 1px solid var(--fms-border-strong); color: var(--fms-text-secondary); }.fms-btn-secondary:hover:not(:disabled), .fms-btn-ghost:hover:not(:disabled) { background: var(--fms-table-row-hover); }.fms-btn-ghost { background: transparent; color: var(--fms-text-secondary); }
+.fms-btn-accent { background: var(--fms-secondary); color: var(--fms-text-inverse); box-shadow: 0 6px 16px color-mix(in srgb, var(--fms-secondary) 32%, transparent); }.fms-btn-accent:hover:not(:disabled) { filter: brightness(1.12); box-shadow: 0 8px 20px color-mix(in srgb, var(--fms-secondary) 42%, transparent); }
+.fms-btn-compact { min-height: 1.875rem; border-radius: .5rem; padding: .3rem .55rem; font-size: .6875rem; }
+.fms-btn-warning { background: var(--fms-warning); color: var(--fms-text-inverse); box-shadow: 0 4px 12px color-mix(in srgb, var(--fms-warning) 24%, transparent); }.fms-btn-warning:hover:not(:disabled) { filter: brightness(1.1); }
+.fms-pos-clockin-alert { background: color-mix(in srgb, var(--fms-warning) 18%, var(--fms-surface)); border-color: color-mix(in srgb, var(--fms-warning) 72%, var(--fms-border)); box-shadow: 0 14px 30px var(--fms-shadow); color: var(--fms-text); }
+.fms-pos-clockin-alert-icon { background: var(--fms-warning); border-color: color-mix(in srgb, var(--fms-warning) 72%, var(--fms-border)); color: var(--fms-text-inverse); }
+.fms-pos-clockin-alert-title { color: var(--fms-text); }.fms-pos-clockin-alert-copy { color: var(--fms-text-secondary); }
+.fms-tab-strip { border-bottom: 1px solid var(--fms-border-strong); padding: .35rem .35rem 0; }
+.fms-tab { border: 1px solid transparent; border-bottom: 0; border-radius: .65rem .65rem 0 0; color: var(--fms-text-muted); padding: .65rem .85rem; transition: background-color .15s, border-color .15s, color .15s; white-space: nowrap; }
+.fms-tab:hover { background: var(--fms-table-row-hover); color: var(--fms-text); }.fms-tab-active { background: var(--fms-surface); border-color: var(--fms-border-strong); color: var(--fms-primary); box-shadow: 0 -3px 0 var(--fms-primary) inset; }
+.fms-dialog-overlay { background: var(--fms-overlay); }.fms-dialog { background: var(--fms-surface); border-color: var(--fms-border-strong); box-shadow: 0 24px 64px var(--fms-shadow); color: var(--fms-text); }.fms-table { background: var(--fms-table-row); color: var(--fms-text); }.fms-table thead { background: var(--fms-table-header); color: var(--fms-text-secondary); }.fms-table tr:hover { background: var(--fms-table-row-hover); }
+.fms-sidebar { background: var(--fms-sidebar-bg); border-color: var(--fms-sidebar-border); color: var(--fms-text); }.fms-sidebar-active { background: var(--fms-sidebar-active-bg); border-color: var(--fms-sidebar-border); color: var(--fms-sidebar-active-text); box-shadow: 0 10px 25px var(--fms-shadow); }
+.fms-sidebar-header { background: var(--fms-sidebar-bg); border-color: var(--fms-sidebar-border); }.fms-sidebar-user-card { background: var(--fms-surface-raised); border-color: var(--fms-sidebar-border); }.fms-sidebar-icon-active { color: var(--fms-sidebar-active-text); }
+.fms-avatar { background: color-mix(in srgb, var(--fms-secondary) 18%, var(--fms-surface-raised)); border-color: color-mix(in srgb, var(--fms-secondary) 42%, var(--fms-border)); color: var(--fms-secondary); }
+
+/* Transitional bridge for existing Tailwind UI. It is scoped to application
+   surfaces, does not affect paper/receipt documents, and uses no !important. */
+:root[data-fms-mode] [class~="bg-slate-950"], :root[data-fms-mode] [class*="bg-slate-950/"] { background-color: var(--fms-input-bg); }
+:root[data-fms-mode] [class~="bg-slate-900"], :root[data-fms-mode] [class*="bg-slate-900/"] { background-color: var(--fms-surface); }
+:root[data-fms-mode] [class~="bg-slate-800"], :root[data-fms-mode] [class*="bg-slate-800/"] { background-color: var(--fms-surface-raised); }
+:root[data-fms-mode] [class~="bg-slate-700"], :root[data-fms-mode] [class*="bg-slate-700/"] { background-color: var(--fms-border-strong); }
+/* Transparency on content cards made the page beneath them read as a dark
+   veil. Only fixed backdrop elements are overlays; all normal content stays
+   solid and legible in every module. */
+:root[data-fms-mode] .fixed[class*="bg-slate-950/"],
+:root[data-fms-mode] .fixed[class*="bg-black/"] { background-color: var(--fms-overlay); }
+:root[data-fms-mode] [class*="border-slate-"] { border-color: var(--fms-border); }
+:root[data-fms-mode="light"] [class~="border"], :root[data-fms-mode="light"] [class*="border-slate-"] { border-color: var(--fms-border); }
+:root[data-fms-mode] [class~="text-white"], :root[data-fms-mode] [class~="text-slate-100"], :root[data-fms-mode] [class~="text-slate-200"] { color: var(--fms-text); }
+:root[data-fms-mode] [class~="text-slate-300"], :root[data-fms-mode] [class~="text-slate-400"] { color: var(--fms-text-secondary); }
+:root[data-fms-mode] [class~="text-slate-500"], :root[data-fms-mode] [class~="text-slate-600"] { color: var(--fms-text-muted); }
+
+/* White-paper documents must not inherit the application's themed text colors. */
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) { background-color: #ffffff !important; color: #111827 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) :is(.text-slate-400, .text-slate-500, .text-slate-600) { color: #475569 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) :is(.text-slate-700, .text-slate-800, .text-slate-900, .text-slate-100, .text-slate-200, .text-slate-300) { color: #111827 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) [class*="border-slate-"] { border-color: #cbd5e1 !important; }
+/* Official documents must keep headings distinct in every application theme. */
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) :is(h1, h2, h3, h4, h5, h6, th, .receipt-heading, .receipt-tax-title, .receipt-payment-title, .receipt-payment-options-title, .receipt-table-head) { font-weight: 700 !important; }
+:root[data-fms-mode] [class~="bg-emerald-600"], :root[data-fms-mode] [class~="bg-emerald-500"] { background-color: var(--fms-primary); }
+:root[data-fms-mode] [class*="bg-emerald-950/"] { background-color: color-mix(in srgb, var(--fms-primary) 16%, var(--fms-surface)); }
+:root[data-fms-mode] [class~="text-emerald-400"], :root[data-fms-mode] [class~="text-emerald-300"], :root[data-fms-mode] [class~="text-emerald-200"] { color: var(--fms-success); }
+:root[data-fms-mode] [class~="bg-rose-600"], :root[data-fms-mode] [class~="bg-rose-500"] { background-color: var(--fms-danger); }
+:root[data-fms-mode] [class*="bg-rose-950/"] { background-color: color-mix(in srgb, var(--fms-danger) 16%, var(--fms-surface)); }
+:root[data-fms-mode] [class~="text-rose-400"], :root[data-fms-mode] [class~="text-rose-300"], :root[data-fms-mode] [class~="text-rose-200"] { color: var(--fms-danger); }
+:root[data-fms-mode] [class~="bg-amber-500"], :root[data-fms-mode] [class~="bg-amber-400"] { background-color: var(--fms-warning); }
+:root[data-fms-mode] [class*="bg-amber-950/"] { background-color: color-mix(in srgb, var(--fms-warning) 16%, var(--fms-surface)); }
+:root[data-fms-mode] [class~="text-amber-400"], :root[data-fms-mode] [class~="text-amber-300"], :root[data-fms-mode] [class~="text-amber-200"] { color: var(--fms-warning); }
+:root[data-fms-mode] [class~="bg-blue-600"], :root[data-fms-mode] [class~="bg-blue-500"] { background-color: var(--fms-secondary); }
+:root[data-fms-mode] [class~="text-blue-400"], :root[data-fms-mode] [class~="text-blue-300"], :root[data-fms-mode] [class~="text-blue-200"] { color: var(--fms-secondary); }
+:root[data-fms-mode] [class*="bg-purple-500/"] { background-color: color-mix(in srgb, var(--fms-secondary) 16%, var(--fms-surface)); }
+:root[data-fms-mode] [class*="border-purple-500/"] { border-color: color-mix(in srgb, var(--fms-secondary) 45%, var(--fms-border)); }
+:root[data-fms-mode] [class~="text-purple-400"], :root[data-fms-mode] [class~="text-purple-300"], :root[data-fms-mode] [class~="text-purple-200"] { color: var(--fms-secondary); }
+:root[data-fms-mode] [class*="bg-cyan-500/"] { background-color: var(--fms-info-bg); }
+:root[data-fms-mode] [class*="border-cyan-500/"] { border-color: color-mix(in srgb, var(--fms-info) 45%, var(--fms-border)); }
+:root[data-fms-mode] [class~="text-cyan-400"], :root[data-fms-mode] [class~="text-cyan-300"], :root[data-fms-mode] [class~="text-cyan-200"] { color: var(--fms-info); }
+:root[data-fms-mode] [class*="bg-red-950/"] { background-color: color-mix(in srgb, var(--fms-danger) 18%, var(--fms-surface)); }
+:root[data-fms-mode] [class~="text-red-400"], :root[data-fms-mode] [class~="text-red-300"], :root[data-fms-mode] [class~="text-red-200"] { color: var(--fms-danger); }
+:root[data-fms-mode] [class*="bg-sky-500/"] { background-color: var(--fms-info-bg); }
+:root[data-fms-mode] [class*="border-sky-500/"] { border-color: color-mix(in srgb, var(--fms-info) 45%, var(--fms-border)); }
+:root[data-fms-mode] button {
+  border-color: color-mix(in srgb, var(--fms-border-strong) 88%, var(--fms-text));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fms-border-strong) 72%, transparent);
+}
+:root[data-fms-mode] button:hover:not(:disabled) {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fms-primary) 54%, var(--fms-border-strong));
+}
+:root[data-fms-mode] button[class*="bg-emerald-"],
+:root[data-fms-mode] button[class*="bg-blue-"],
+:root[data-fms-mode] button[class*="bg-rose-"],
+:root[data-fms-mode] button[class*="bg-amber-"] { color: var(--fms-text-inverse); }
+:root[data-fms-mode] button[class*="bg-emerald-500/"] { background-color: var(--fms-primary); }
+:root[data-fms-mode] button[class*="bg-blue-500/"] { background-color: var(--fms-secondary); }
+:root[data-fms-mode] button[class*="bg-amber-500/"] { background-color: var(--fms-warning); }
+:root[data-fms-mode] button[class*="bg-rose-500/"] { background-color: var(--fms-danger); }
+/* Treat legacy utility-styled controls as buttons, not translucent content
+   overlays. This gives POS selectors, cart controls, and action buttons the
+   same solid visual foundation as the DT-FMS button primitives. */
+:root[data-fms-mode] button[class*="bg-slate-"] { background-color: var(--fms-surface-raised); }
+:root[data-fms-mode] button[class*="bg-emerald-"] { background-color: var(--fms-primary); }
+:root[data-fms-mode] button[class*="bg-blue-"] { background-color: var(--fms-secondary); }
+:root[data-fms-mode] button[class*="bg-amber-"] { background-color: var(--fms-warning); }
+:root[data-fms-mode] button[class*="bg-rose-"] { background-color: var(--fms-danger); }
+:root[data-fms-mode] button[class*="bg-slate-"] { color: var(--fms-text-secondary); }
+:root[data-fms-mode] [class*="placeholder:text-slate-"]::placeholder { color: var(--fms-text-muted); opacity: 1; }
+/* Existing components still use Tailwind hover utilities. Keep those hover
+   states inside the active theme so a light workspace never flashes a dark
+   slate panel or unreadable white label. */
+:root[data-fms-mode] [class*="hover:bg-slate-"]:hover { background-color: var(--fms-table-row-hover); }
+:root[data-fms-mode] [class*="hover:border-slate-"]:hover { border-color: var(--fms-border-strong); }
+:root[data-fms-mode] [class*="hover:text-slate-200"]:hover,
+:root[data-fms-mode] [class*="hover:text-white"]:hover { color: var(--fms-text); }
+:root[data-fms-mode] [class*="hover:bg-emerald-"]:hover { background-color: var(--fms-primary-hover); }
+:root[data-fms-mode] [class*="hover:bg-blue-"]:hover { background-color: var(--fms-secondary); }
+:root[data-fms-mode] [class*="hover:bg-amber-"]:hover { background-color: var(--fms-warning); }
+:root[data-fms-mode] [class*="hover:bg-rose-"]:hover { background-color: var(--fms-danger); }
+:root[data-fms-mode] button[class*="bg-emerald-"][class*="hover:text-white"]:hover,
+:root[data-fms-mode] button[class*="bg-blue-"][class*="hover:text-white"]:hover,
+:root[data-fms-mode] button[class*="bg-amber-"][class*="hover:text-white"]:hover,
+:root[data-fms-mode] button[class*="bg-rose-"][class*="hover:text-white"]:hover { color: var(--fms-text-inverse); }
+:root[data-fms-mode] main table { background: var(--fms-table-row); color: var(--fms-text); border-color: var(--fms-border); }
+:root[data-fms-mode] main table thead, :root[data-fms-mode] main table th { background: var(--fms-table-header); color: var(--fms-text-secondary); border-color: var(--fms-border-strong); }
+:root[data-fms-mode] main table td { border-color: var(--fms-border); }
+:root[data-fms-mode] main table tbody tr:hover { background: var(--fms-table-row-hover); }
+:root[data-fms-mode] input:not([type="checkbox"]):not([type="radio"]), :root[data-fms-mode] select, :root[data-fms-mode] textarea { color: var(--fms-text); }
+:root[data-fms-mode] input:not([type="checkbox"]):not([type="radio"]), :root[data-fms-mode] select, :root[data-fms-mode] textarea { border-color: var(--fms-input-border); }
+/* Users dialogs stay modal in light modes without casting a dark veil over the tab. */
+:root[data-fms-mode="light"] .fms-user-overlay { background-color: rgba(255, 255, 255, .52); }
+:root[data-fms-mode] .fms-user-row { background-color: var(--fms-table-row); transition: background-color .15s; }
+:root[data-fms-mode] .fms-user-row:hover { background-color: var(--fms-table-row-hover); }
+
+.logo-container { display: flex; align-items: center; justify-content: center; overflow: visible; flex-shrink: 0; }.logo-container img, .app-logo { display: block; width: 100%; height: 100%; object-fit: contain; flex-shrink: 0; }.app-logo { height: 48px; }.logo-container--sidebar { display: flex; width: 240px; height: 72px; padding: 0 16px; justify-content: center; align-items: center; }.app-logo--sidebar { width: 100%; height: 100%; }.logo-container--header { display: flex; width: 200px; height: 64px; justify-content: flex-start; align-items: center; }.app-logo--header { width: 100%; height: 48px; object-position: left center; }.logo-container--login, .logo-container--signup { display: flex; width: min(500px, 90vw); height: 180px; justify-content: center; align-items: center; }.app-logo--login, .app-logo--signup { width: 100%; height: 100%; }
+* { scrollbar-color: var(--fms-secondary) var(--fms-surface); } ::selection { background: color-mix(in srgb, var(--fms-secondary) 40%, transparent); color: var(--fms-text-inverse); }
+
+/* Keep documents white paper in both modes. This must follow the global theme bridge. */
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper),
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) [class*="bg-white"] { background-color: #ffffff !important; color: #111827 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) :is(.text-slate-400, .text-slate-500, .text-slate-600) { color: #475569 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) :is(.text-slate-700, .text-slate-800, .text-slate-900, .text-slate-100, .text-slate-200, .text-slate-300) { color: #111827 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) [class*="border-slate-"] { border-color: #cbd5e1 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) [class~="bg-slate-900"] { background-color: #111827 !important; }
+:root[data-fms-mode] :is([data-printable-document], [data-reprint-document], .thermal-receipt, .receipt-paper, .document-preview-paper) [class~="text-white"] { color: #ffffff !important; }

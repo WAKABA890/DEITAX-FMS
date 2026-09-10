@@ -1,0 +1,4745 @@
+import express from 'express';
+import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'crypto';
+import { createServer as createViteServer } from 'vite';
+import { getSqlite } from './src/database/db.js';
+import {
+  deleteProductAndLinkedRecords,
+  deletePumpNozzleAndLinkedRecords,
+  deleteTankAndLinkedRecords,
+  ensurePumpRecord,
+} from './src/database/cleanup.js';
+import { initializeDatabaseMiddleware } from './src/server/db-middleware.js';
+import {
+  INITIAL_USERS,
+  INITIAL_PRODUCTS,
+  INITIAL_TANKS,
+  INITIAL_PUMPS,
+  INITIAL_SHOP_ITEMS,
+  INITIAL_SHIFTS,
+  INITIAL_SCHEDULES,
+  INITIAL_TRANSACTIONS,
+  INITIAL_DELIVERIES,
+  INITIAL_APPROVALS,
+  INITIAL_AUDIT_LOGS,
+  INITIAL_CUSTOMERS,
+  INITIAL_CASH_FLOW,
+  INITIAL_SUPPLIERS,
+  INITIAL_STOCK_ADJUSTMENTS,
+  INITIAL_CREDIT_NOTES,
+  INITIAL_STATION_SETTINGS,
+} from './src/data/initialData.js';
+import {
+  User,
+  FuelProduct,
+  FuelTank,
+  PumpNozzle,
+  ShopItem,
+  ShiftSession,
+  Transaction,
+  ThreeWayReconciliation,
+  FuelDelivery,
+  ManagerApproval,
+  AuditLog,
+  ShiftSchedule,
+  StationSettings,
+  CreditNote,
+  CustomerAccount,
+  CashFlowRecord,
+  SupplierAccount,
+  SupplierPayment,
+  StockAdjustment,
+  TaxCode,
+  PERMISSIONS,
+} from './src/types.js';
+import { TAX_RATE_MAP, normalizeTaxCode as normalizeTaxCodeValue } from './src/constants/tax.ts';
+import { computeDocumentTotals } from './src/utils/documentTotals.ts';
+import { normalizeStockAdjustmentsFromDatabase, rebuildShiftSummaries } from './src/utils/shift-summary.ts';
+import { buildDashboardSalesSummary } from './src/utils/sales-summary.ts';
+
+const VITE_HMR_PORT = 5173;
+
+export interface StartServerOptions {
+  port?: number;
+  staticDir?: string;
+}
+
+export interface StartedServer {
+  port: number;
+  close: () => Promise<void>;
+}
+
+export async function startServer(
+  options: StartServerOptions = {}
+): Promise<StartedServer> {
+  const app = express();
+
+  const staticDir =
+    options.staticDir ||
+    process.env.FMS_STATIC_DIR ||
+    path.dirname(fileURLToPath(import.meta.url));
+
+  const PORT =
+    options.port ??
+    (process.env.PORT ? Number(process.env.PORT) : 0);
+
+  if (!Number.isFinite(PORT) || PORT < 0 || PORT > 65535) {
+    throw new Error(`Invalid server port: ${PORT}`);
+  }
+
+  let shuttingDown = false;
+  let viteDevServer: any = null;
+
+  const closeServer = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    if (viteDevServer && typeof viteDevServer.close === 'function') {
+      await Promise.resolve(viteDevServer.close());
+      viteDevServer = null;
+    }
+
+    if (server && server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error?: Error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    }
+  };
+
+  const shutdown = async () => {
+    console.log('\nShutting down development server...');
+    try {
+      await closeServer();
+      console.log('Development server stopped.');
+      process.exit(0);
+    } catch (error) {
+      console.error('Error shutting down development server:', error);
+      process.exit(1);
+    }
+  };
+
+  const server = app.listen(PORT, '127.0.0.1');
+
+  const startup = new Promise<void>((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
+
+  server.on('error', (error: NodeJS.ErrnoException) => {
+    if (error.code === 'EADDRINUSE') {
+      console.error(`\n❌ Development port ${PORT} is already in use.`);
+      return;
+    }
+    console.error('Server startup error:', error);
+  });
+
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
+
+  app.use(express.json({ limit: '10mb' }));
+
+  const db = initializeDatabaseMiddleware();
+  console.log('✅ Database initialized');
+
+  const normalizeSupplierRecord = (supplier: any) => ({
+    ...supplier,
+    id: supplier.id || supplier.supplierId || 'sup-' + Date.now(),
+    name: supplier.name || supplier.supplierName || 'Unnamed Supplier',
+    contactPerson: supplier.contactPerson ?? supplier.contact_person ?? '',
+    phone: supplier.phone || supplier.contactPhone || '',
+    email: supplier.email ?? null,
+    address: supplier.address ?? null,
+    kraPin: supplier.kraPin ?? supplier.taxId ?? null,
+    currentBalance: Number(supplier.currentBalance ?? supplier.accountBalance ?? 0),
+    paymentTerms: supplier.paymentTerms ?? supplier.payment_terms ?? 'Net 14 Days',
+    status: supplier.status || 'Active',
+    createdAt: supplier.createdAt || new Date().toISOString(),
+  });
+
+  const normalizeCustomerRecord = (customer: any) => ({
+    ...customer,
+    id: customer.id || customer.customerId || 'cust-' + Date.now(),
+    name: customer.name || customer.businessName || 'Unnamed Customer',
+    kraPin: customer.kraPin ?? customer.taxId ?? '',
+    phone: customer.phone || customer.contactPhone || '',
+    email: customer.email ?? '',
+    address: customer.address ?? '',
+    creditLimit: Number(customer.creditLimit ?? customer.credit_limit ?? 0),
+    currentBalance: Number(customer.currentBalance ?? customer.currentDebt ?? 0),
+    vehicles: Array.isArray(customer.vehicles)
+      ? customer.vehicles
+      : Array.isArray(customer.vehiclePlates)
+        ? customer.vehiclePlates
+        : [],
+    status: customer.status || 'Active',
+    createdAt: customer.createdAt || new Date().toISOString(),
+  });
+
+  const persistentData = db.getAllData() as any;
+  const hasPersistedDocumentRecords = (Array.isArray(persistentData.transactions) && persistentData.transactions.length > 0)
+    || (Array.isArray(persistentData.creditNotes) && persistentData.creditNotes.length > 0)
+    || (Array.isArray(persistentData.deliveries) && persistentData.deliveries.length > 0)
+    || (Array.isArray(persistentData.cashFlow) && persistentData.cashFlow.length > 0);
+
+  const allData = persistentData;
+  let users: User[] = (allData.users as User[]) ?? [];
+  let products: FuelProduct[] = (allData.products as FuelProduct[]) ?? [];
+
+  const normalizeRoleName = (value?: string | null) => {
+    const candidate = String(value || '').trim();
+    if (!candidate) return 'Normal User';
+    const normalized = candidate.toLowerCase().replace(/[^a-z]+/g, '-');
+    if (normalized === 'super-admin' || candidate === 'Super Admin') return 'Super Admin';
+    if (normalized === 'admin' || candidate === 'Admin') return 'Admin';
+    if (normalized === 'station-manager' || candidate === 'Station Manager') return 'Station Manager';
+    if (normalized === 'auditor' || candidate === 'Auditor') return 'Auditor';
+    if (normalized === 'fuel-attendant' || candidate === 'Fuel Attendant') return 'Fuel Attendant';
+    if (normalized === 'shop-attendant' || candidate === 'Shop Attendant') return 'Shop Attendant';
+    if (normalized === 'cashier' || candidate === 'Cashier') return 'Cashier';
+    if (normalized === 'normal-user' || candidate === 'Normal User') return 'Normal User';
+    if (normalized === 'standard-user' || candidate === 'Standard User') return 'Standard User';
+    return candidate || 'Normal User';
+  };
+
+  const isSuperAdminRole = (role?: string | null) => normalizeRoleName(role) === 'Super Admin';
+  const isAdminRole = (role?: string | null) => isSuperAdminRole(role) || normalizeRoleName(role) === 'Admin';
+  const isStandardUserRole = (role?: string | null) => ['Normal User', 'Standard User'].includes(normalizeRoleName(role));
+  type Permission = import('./src/types.js').Permission;
+  const getPermissions = (userId: string): Permission[] => getSqlite().prepare(
+    'SELECT permission FROM user_permissions WHERE user_id = ? ORDER BY permission'
+  ).all(userId).map((row: any) => row.permission as Permission);
+  const getRolePermissions = (role: string): Permission[] => getSqlite().prepare(
+    `SELECT rp.permission FROM custom_role_permissions rp
+     JOIN custom_roles r ON r.name = rp.role_name
+     WHERE r.name = ? COLLATE NOCASE AND r.active = 1`
+  ).all(role).map((row: any) => row.permission as Permission);
+  const getPermissionOverrides = (userId: string): Map<Permission, boolean> => new Map(
+    getSqlite().prepare('SELECT permission, granted FROM user_permission_overrides WHERE user_id = ?')
+      .all(userId)
+      .map((row: any) => [row.permission as Permission, Boolean(row.granted)] as const)
+  );
+  const isAssignableRole = (role: string) => {
+    const candidate = String(role || '').trim();
+    if (!candidate) return false;
+    // Only the two system administration roles are built in. Operational roles
+    // are always configured custom roles, rather than fixed job titles.
+    if (['Super Admin', 'Admin'].includes(normalizeRoleName(candidate))) return true;
+    const customRole = getSqlite().prepare(
+      'SELECT 1 FROM custom_roles WHERE name = ? COLLATE NOCASE AND active = 1'
+    ).get(candidate);
+    return Boolean(customRole);
+  };
+  const getUserById = (userId: string): User | undefined => db.userQueries.byId(userId) as any;
+  const hasPermission = (user: User | undefined, permission: Permission) => {
+    if (!user) return false;
+    // Every role except Super Admin requires an explicit permission grant.
+    if (isSuperAdminRole(user.role)) return true;
+    const stationManagerVariancePermission = normalizeRoleName(user.role) === 'Station Manager'
+      && ['VIEW_DIP_VARIANCE', 'REVIEW_DIP_VARIANCE', 'RESOLVE_DIP_VARIANCE'].includes(permission);
+    return stationManagerVariancePermission || getPermissions(user.id).includes(permission) || getRolePermissions(user.role).includes(permission);
+  };
+  const isValidPin = (value: unknown) => /^\d{4,6}$/.test(String(value ?? ''));
+  const hashPin = (pin: string) => {
+    const salt = randomBytes(16).toString('base64');
+    const derivedKey = scryptSync(pin, salt, 64).toString('base64');
+    return `scrypt$${salt}$${derivedKey}`;
+  };
+  const verifyStoredPin = (storedValue: unknown, submittedPin: unknown) => {
+    const storedPin = String(storedValue ?? '');
+    const candidatePin = String(submittedPin ?? '');
+    if (!isValidPin(candidatePin)) return { valid: false, legacy: false };
+    if (!storedPin.startsWith('scrypt$')) {
+      const sameLength = Buffer.byteLength(storedPin) === Buffer.byteLength(candidatePin);
+      return { valid: sameLength && timingSafeEqual(Buffer.from(storedPin), Buffer.from(candidatePin)), legacy: true };
+    }
+    const [, salt, encodedKey] = storedPin.split('$');
+    if (!salt || !encodedKey) return { valid: false, legacy: false };
+    const expected = Buffer.from(encodedKey, 'base64');
+    const actual = scryptSync(candidatePin, salt, expected.length);
+    return { valid: expected.length === actual.length && timingSafeEqual(expected, actual), legacy: false };
+  };
+  const getEffectivePermissions = (user: User): Permission[] => {
+    const effective = new Set<Permission>([...getPermissions(user.id), ...getRolePermissions(user.role)]);
+    for (const [permission, granted] of getPermissionOverrides(user.id)) {
+      if (granted) effective.add(permission);
+      else effective.delete(permission);
+    }
+    return [...effective].sort();
+  };
+  const requiresPasswordChange = (user: User | undefined) => Boolean(
+    (user as any)?.mustChangePassword ?? (user as any)?.must_change_password
+  );
+  const toAuthenticatedUser = (user: User): User => ({
+    ...user,
+    // Raw SQLite authentication queries use snake_case; normalize it in the
+    // login response so the forced-PIN gate renders in the very first frame.
+    mustChangePassword: requiresPasswordChange(user),
+    pin: undefined as any,
+    permissions: getEffectivePermissions(user),
+  });
+  const requirePermission = (req: any, res: any, permission: Permission, action: string) => {
+    if (hasPermission(req.authUser, permission)) return null;
+    if (req.authUser) addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'PERMISSION_DENIED', 'Auth', `Blocked ${action}; requires ${permission}.`, 'Warning');
+    return res.status(403).json({ success: false, message: `Permission required: ${permission}.` });
+  };
+  const delegatedPermissionForMutation = (method: string, path: string): Permission | null => {
+    if (method === 'POST' && path === '/shift-plans') return 'CREATE_SHIFT';
+    if (method === 'POST' && /^\/shift-plans\/[^/]+\/assignments$/.test(path)) return 'ASSIGN_SHIFT_USERS';
+    if (method === 'DELETE' && /^\/shift-plans\/[^/]+\/assignments\/[^/]+$/.test(path)) return 'REMOVE_SHIFT_USERS';
+    if (method === 'POST' && path === '/users') return 'CREATE_USER';
+    if (method === 'PUT' && /^\/users\/[^/]+\/permissions$/.test(path)) return 'MANAGE_USERS';
+    if (method === 'POST' && /^\/users\/[^/]+\/reset-pin$/.test(path)) return 'RESET_USER_PASSWORD';
+    if (method === 'POST' && /^\/reading-variances\/[^/]+\/review$/.test(path)) return 'REVIEW_DIP_VARIANCE';
+    if (method === 'POST' && /^\/reading-variances\/[^/]+\/resolve$/.test(path)) return 'RESOLVE_DIP_VARIANCE';
+    return null;
+  };
+  const restrictedPermissions = new Set<Permission>(['MANAGE_USERS', 'MANAGE_SETTINGS', 'DELETE_PUMP']);
+  // requireRole function has been removed – we use requirePermission everywhere.
+
+  const normalizeTaxCode = (value: string | undefined): TaxCode => {
+    try {
+      return normalizeTaxCodeValue(value ?? 'B');
+    } catch {
+      return 'B';
+    }
+  };
+
+  const getTaxRateByCode = (taxCode: string | undefined) => {
+    const normalized = normalizeTaxCode(taxCode);
+    return TAX_RATE_MAP[normalized] ?? 0;
+  };
+
+  const inferFuelProductCost = (name: string) => {
+    const normalized = String(name || '').toLowerCase();
+    if (/(diesel|ago|gasoil)/.test(normalized)) return 145;
+    if (/(petrol|gasoline|premium|unl|super)/.test(normalized)) return 170;
+    return 150;
+  };
+
+  products = products.map((product) => {
+    const safeCost = Number(product.costPerLiter ?? 0);
+    const safePrice = Number(product.pricePerLiter ?? 0);
+    const resolvedCost = safeCost > 0 ? safeCost : inferFuelProductCost(product.name);
+    const resolvedPrice = safePrice > 0 ? safePrice : resolvedCost + 20;
+    const taxCode = normalizeTaxCode((product as any).taxCode || (product as any).taxType || (
+      Number(product.taxRate ?? 0) === 0.08 ? 'E' : Number(product.taxRate ?? 0) === 0.16 ? 'B' : 'A'
+    ));
+    const taxRate = Number(product.taxRate ?? getTaxRateByCode(taxCode));
+
+    return {
+      ...product,
+      costPerLiter: resolvedCost,
+      pricePerLiter: resolvedPrice,
+      taxCode,
+      taxRate,
+    };
+  });
+
+  products.forEach((product) => {
+    try {
+      db.productQueries.update(product.id, {
+        code: product.code,
+        name: product.name,
+        pricePerLiter: Number(product.pricePerLiter ?? product.costPerLiter ?? 0),
+        costPerLiter: Number(product.costPerLiter ?? product.pricePerLiter ?? 0),
+        taxRate: Number(product.taxRate ?? 0.16),
+        taxCode: String(product.taxCode ?? 'B').toUpperCase(),
+        unit: product.unit ?? 'L',
+        color: product.color ?? '#10b981',
+      } as any);
+    } catch (error) {
+      console.warn('Failed to normalize product cost:', product.name, error);
+    }
+  });
+
+  let tanks: FuelTank[] = (allData.tanks as FuelTank[]) ?? [];
+  let pumps: PumpNozzle[] = (allData.pumps as PumpNozzle[]) ?? [];
+  let shopItems: ShopItem[] = (allData.shopItems as ShopItem[]) ?? [];
+  const parseReadingList = (value: unknown) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    try {
+      const parsed = JSON.parse(String(value));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  let shifts: ShiftSession[] = ((allData.shifts as ShiftSession[]) ?? []).map((shift: any) => ({
+    ...shift,
+    openingPumpReadings: parseReadingList(shift.openingPumpReadingsJson),
+    openingTankDips: parseReadingList(shift.openingTankDipsJson),
+    closingPumpReadings: parseReadingList(shift.closingPumpReadingsJson),
+    closingTankDips: parseReadingList(shift.closingTankDipsJson),
+  }));
+  shifts = shifts.map((shift) => ({
+    ...shift,
+    status: shift.status === 'Active' ? 'Active' : shift.status,
+    endTime: shift.status === 'Active' ? null : shift.endTime ?? null,
+    approvalStatus: shift.status === 'Active' ? undefined : shift.approvalStatus,
+  }));
+  let schedules: ShiftSchedule[] = (allData.schedules as ShiftSchedule[]) ?? [];
+
+  const normalizeDocumentNumber = (value: string | undefined, prefix: 'Rcpt' | 'Inv' | 'Cn') => {
+    const raw = String(value ?? '').trim();
+    const currentYear = new Date().getFullYear();
+
+    if (!raw) {
+      return `${prefix}-${currentYear}-0000`;
+    }
+
+    const yearMatch = raw.match(/-(\d{4})-/);
+    const sequenceMatch = raw.match(/-(\d+)$/);
+
+    const year = yearMatch ? yearMatch[1] : currentYear;
+    const sequenceNumber = sequenceMatch ? Number(sequenceMatch[1]) : 0;
+
+    return `${prefix}-${year}-${String(sequenceNumber).padStart(4, '0')}`;
+  };
+
+  const normalizeStoredTransaction = (tx: any): Transaction => {
+    const normalizedReceiptNo = String(tx?.receiptNo ?? tx?.receiptNumber ?? '').trim();
+    const normalizedInvoiceNo = String(tx?.taxInvoiceNo ?? tx?.invoiceNumber ?? '').trim();
+    const rawDocumentType = String(
+      tx?.documentType ?? tx?.document_type ?? (normalizedInvoiceNo ? 'Invoice' : 'Receipt')
+    ).trim();
+    const normalizedDocumentType = rawDocumentType.toLowerCase();
+    const resolvedDocumentType = normalizedDocumentType === 'invoice'
+      ? 'Invoice'
+      : normalizedDocumentType === 'credit note' || normalizedDocumentType === 'credit-note'
+        ? 'Credit Note'
+        : 'Receipt';
+    const rawSaleType = String(tx?.type ?? '').trim().toLowerCase();
+    const resolvedSaleType = rawSaleType === 'shop'
+      ? 'Shop'
+      : rawSaleType === 'fuel'
+        ? 'Fuel'
+        : (tx?.pumpId ?? tx?.pump_id ?? tx?.productId ?? tx?.product_id) ? 'Fuel' : 'Shop';
+
+    let storedItems: any[] = Array.isArray(tx?.items) ? tx.items : [];
+    if (storedItems.length === 0 && typeof tx?.itemsJson === 'string') {
+      try {
+        storedItems = JSON.parse(tx.itemsJson);
+      } catch {
+        storedItems = [];
+      }
+    }
+
+    return {
+      ...tx,
+      id: String(tx?.id || 'tx-unknown'),
+      receiptNo: normalizedReceiptNo ? normalizeDocumentNumber(normalizedReceiptNo, 'Rcpt') : (tx?.receiptNo || tx?.receiptNumber || ''),
+      taxInvoiceNo: normalizedInvoiceNo ? normalizeDocumentNumber(normalizedInvoiceNo, 'Inv') : (tx?.taxInvoiceNo || tx?.invoiceNumber || undefined),
+      documentType: resolvedDocumentType,
+      customerName: tx?.customerName ?? tx?.customer_name ?? 'Walk-in Customer',
+      customerPin: tx?.customerPin ?? tx?.customer_pin ?? undefined,
+      vehiclePlate: tx?.vehiclePlate ?? tx?.vehicle_plate ?? undefined,
+      paymentMethod: tx?.paymentMethod ?? tx?.payment_method ?? 'Cash',
+      status: tx?.status ?? 'Completed',
+      timestamp: tx?.timestamp ?? (tx?.date ? `${tx.date}T${tx.time || '00:00:00'}.000Z` : new Date().toISOString()),
+      shiftId: tx?.shiftId ?? tx?.shift_id ?? 'unknown-shift',
+      staffId: tx?.staffId ?? tx?.staff_id ?? 'unknown-staff',
+      staffName: tx?.staffName ?? tx?.staff_name ?? 'Cashier',
+      type: resolvedSaleType,
+      items: storedItems,
+      subtotal: Number(tx?.subtotal ?? 0),
+      taxAmount: Number(tx?.taxAmount ?? tx?.tax ?? 0),
+      totalAmount: Number(tx?.totalAmount ?? 0),
+    } as Transaction;
+  };
+
+  const normalizeStoredReconciliation = (record: any): ThreeWayReconciliation => {
+    let details: any = {};
+    try {
+      details = record?.varianceNotes ? JSON.parse(record.varianceNotes) : {};
+    } catch {
+      details = {};
+    }
+
+    return {
+      id: String(record?.id || ''),
+      shiftId: String(record?.shiftId ?? record?.shift_id ?? ''),
+      staffId: String(record?.staffId ?? record?.staff_id ?? ''),
+      staffName: String(record?.staffName ?? record?.staff_name ?? ''),
+      timestamp: String(details.timestamp ?? record?.date ?? record?.createdAt ?? new Date().toISOString()),
+      expectedCash: Number(record?.cashExpected ?? record?.cash_expected ?? 0),
+      cashCount: details.cashCount ?? {},
+      totalActualCash: record?.cashActual ?? record?.cash_actual ?? undefined,
+      cashVariance: record?.cashVariance ?? record?.cash_variance ?? undefined,
+      pumpReadings: details.pumpReadings ?? [],
+      totalPumpVarianceLiters: Number(record?.pumpVariance ?? record?.pump_variance ?? 0),
+      tankDips: details.tankDips ?? [],
+      totalTankVarianceLiters: Number(record?.tankVariance ?? record?.tank_variance ?? 0),
+      status: record?.status ?? 'Pending Approval',
+      managerId: record?.approvedBy ?? record?.approved_by ?? undefined,
+      managerNotes: details.managerNotes ?? undefined,
+    } as ThreeWayReconciliation;
+  };
+
+  const normalizeStoredDelivery = (delivery: any): FuelDelivery => {
+    const tankId = String(delivery?.tankId ?? delivery?.tank_id ?? '');
+    const tank = tanks.find((t) => t.id === tankId);
+
+    return {
+      ...delivery,
+      id: String(delivery?.id || ''),
+      timestamp: String(delivery?.timestamp ?? `${delivery?.deliveryDate ?? new Date().toISOString().slice(0, 10)}T${delivery?.deliveryTime ?? '00:00:00'}`),
+      supplierId: String(delivery?.supplierId ?? delivery?.supplier_id ?? ''),
+      tankId,
+      tankName: String(delivery?.tankName ?? delivery?.tank_name ?? tank?.tankName ?? ''),
+      supplierName: String(delivery?.supplierName ?? delivery?.supplier_name ?? ''),
+      deliveryNoteNo: String(delivery?.deliveryNoteNo ?? delivery?.invoiceNumber ?? delivery?.invoice_number ?? ''),
+      litersReceived: Number(delivery?.litersReceived ?? delivery?.quantity ?? 0),
+      costPerLiter: Number(delivery?.costPerLiter ?? delivery?.unitPrice ?? delivery?.unit_price ?? 0),
+      totalCost: Number(delivery?.totalCost ?? delivery?.total_cost ?? 0),
+      openingLevel: Number(delivery?.openingLevel ?? delivery?.opening_level ?? 0),
+      closingLevel: Number(delivery?.closingLevel ?? delivery?.closing_level ?? 0),
+      driverName: String(delivery?.driverName ?? delivery?.driver_name ?? 'Driver'),
+      truckPlate: String(delivery?.truckPlate ?? delivery?.vehicleReg ?? delivery?.vehicle_reg ?? ''),
+      receivedBy: String(delivery?.receivedByName ?? delivery?.received_by_name ?? 'Station Staff'),
+    };
+  };
+
+  const normalizeStoredCashFlow = (record: any): CashFlowRecord => ({
+    ...record,
+    id: String(record?.id || ''),
+    timestamp: String(record?.timestamp ?? `${record?.date ?? new Date().toISOString().slice(0, 10)}T00:00:00.000Z`),
+    type: record?.type === 'Expense' ? 'Outflow' : (record?.type === 'Outflow' ? 'Outflow' : 'Inflow'),
+    category: record?.category ?? 'Other',
+    amount: Number(record?.amount ?? 0),
+    paymentMethod: record?.paymentMethod ?? record?.accountingMethod ?? record?.accounting_method ?? 'Cash',
+    referenceNo: record?.referenceNo ?? record?.reference_no ?? record?.notes ?? undefined,
+    description: record?.description ?? '',
+    recordedBy: record?.recordedByName ?? record?.recorded_by_name ?? record?.recordedBy ?? 'Station Staff',
+  } as CashFlowRecord);
+
+  const normalizeStoredCreditNote = (cn: any) => {
+    const rawStoredItems = cn.itemsJson ?? cn.items_json ?? cn.items;
+    let parsedItems: any[] = [];
+    try {
+      parsedItems = Array.isArray(rawStoredItems)
+        ? rawStoredItems
+        : typeof rawStoredItems === 'string' && rawStoredItems.trim()
+          ? JSON.parse(rawStoredItems)
+          : Array.isArray(cn.items)
+            ? cn.items
+            : [];
+    } catch (error) {
+      parsedItems = Array.isArray(cn.items) ? cn.items : [];
+    }
+
+    const inferredOriginalDocumentType = cn.originalDocumentType ||
+      (cn.originalInvoiceNo ? 'invoice' : cn.originalReceiptNo ? 'receipt' : undefined);
+
+    const inferredOriginalDocumentNo = String(
+      cn.originalDocumentNo ||
+      (inferredOriginalDocumentType === 'invoice'
+        ? cn.originalInvoiceNo
+        : inferredOriginalDocumentType === 'receipt'
+          ? cn.originalReceiptNo
+          : '') || ''
+    ).trim();
+
+    return {
+      ...cn,
+      items: Array.isArray(parsedItems) ? parsedItems.map((item: any) => ({
+        ...item,
+        qty: Number(item.qty ?? 1),
+        unitPrice: Number(item.unitPrice ?? item.unit_price ?? 0),
+        totalPrice: Number(item.totalPrice ?? item.total_price ?? ((Number(item.qty ?? 1) * Number(item.unitPrice ?? item.unit_price ?? 0)))),
+        taxAmount: Number(item.taxAmount ?? item.tax_amount ?? 0),
+        taxCode: item.taxCode || item.tax_type || 'A',
+      })) : [],
+      subtotal: Number(cn.subtotal ?? 0),
+      taxAmount: Number(cn.taxAmount ?? cn.tax_amount ?? 0),
+      totalAmount: Number(cn.totalAmount ?? cn.total_amount ?? (cn.subtotal ?? 0) + (cn.taxAmount ?? cn.tax_amount ?? 0)),
+      creditNoteNo: normalizeDocumentNumber(cn.creditNoteNo, 'Cn'),
+      originalDocumentType: inferredOriginalDocumentType,
+      originalDocumentNo: inferredOriginalDocumentNo || undefined,
+      originalInvoiceNo: String(cn.originalInvoiceNo || (inferredOriginalDocumentType === 'invoice' ? inferredOriginalDocumentNo : '') || '').trim(),
+      originalReceiptNo: String(cn.originalReceiptNo || (inferredOriginalDocumentType === 'receipt' ? inferredOriginalDocumentNo : '') || '').trim(),
+    } as CreditNote;
+  };
+
+  const repairLegacyCreditNoteReferences = () => {
+    const repaired = creditNotes.map((cn) => {
+      const resolvedOriginalDocumentType = cn.originalDocumentType ||
+        (cn.originalInvoiceNo ? 'invoice' : cn.originalReceiptNo ? 'receipt' : undefined);
+
+      const resolvedOriginalDocumentNo = String(
+        cn.originalDocumentNo ||
+        (resolvedOriginalDocumentType === 'invoice'
+          ? cn.originalInvoiceNo
+          : resolvedOriginalDocumentType === 'receipt'
+            ? cn.originalReceiptNo
+            : '') || ''
+      ).trim();
+
+      if (!resolvedOriginalDocumentNo && cn.originalTransactionId) {
+        const originalTx = transactions.find((tx) => tx.id === cn.originalTransactionId);
+        if (originalTx) {
+          const recoveredNo = resolvedOriginalDocumentType === 'invoice'
+            ? originalTx.taxInvoiceNo
+            : resolvedOriginalDocumentType === 'receipt'
+              ? originalTx.receiptNo
+              : originalTx.taxInvoiceNo || originalTx.receiptNo;
+
+          if (recoveredNo) {
+            return {
+              ...cn,
+              originalDocumentType: resolvedOriginalDocumentType,
+              originalDocumentNo: recoveredNo,
+              originalInvoiceNo: resolvedOriginalDocumentType === 'invoice' ? recoveredNo : '',
+              originalReceiptNo: resolvedOriginalDocumentType === 'receipt' ? recoveredNo : '',
+            };
+          }
+        }
+      }
+
+      if (!resolvedOriginalDocumentNo) {
+        return cn;
+      }
+
+      return {
+        ...cn,
+        originalDocumentType: resolvedOriginalDocumentType,
+        originalDocumentNo: resolvedOriginalDocumentNo,
+        originalInvoiceNo: resolvedOriginalDocumentType === 'invoice' ? resolvedOriginalDocumentNo : (cn.originalInvoiceNo || ''),
+        originalReceiptNo: resolvedOriginalDocumentType === 'receipt' ? resolvedOriginalDocumentNo : (cn.originalReceiptNo || ''),
+      };
+    });
+
+    creditNotes = repaired;
+
+    repaired.forEach((cn) => {
+      if (!cn.originalDocumentNo && !cn.originalInvoiceNo && !cn.originalReceiptNo && !cn.originalTransactionId) return;
+      const hasCanonical = !!cn.originalDocumentNo;
+      const needsWriteBack = !hasCanonical || !cn.originalDocumentType;
+
+      if (needsWriteBack) {
+        try {
+          db.creditNoteQueries.update(cn.id, {
+            itemsJson: JSON.stringify(cn.items || []),
+            originalDocumentType: cn.originalDocumentType || undefined,
+            originalDocumentNo: cn.originalDocumentNo || undefined,
+            originalInvoiceNo: cn.originalInvoiceNo || undefined,
+            originalReceiptNo: cn.originalReceiptNo || undefined,
+            originalTransactionId: cn.originalTransactionId || undefined,
+            subtotal: Number(cn.subtotal ?? 0),
+            taxAmount: Number(cn.taxAmount ?? 0),
+            totalAmount: Number(cn.totalAmount ?? (cn.subtotal ?? 0) + (cn.taxAmount ?? 0)),
+          } as any);
+        } catch (error) {
+          console.warn('Failed to repair legacy credit note reference:', error);
+        }
+      }
+    });
+  };
+
+  let transactions: Transaction[] = ((allData.transactions as Transaction[]) ?? []).map(normalizeStoredTransaction);
+  const hydrateShiftSummaries = () => {
+    shifts = rebuildShiftSummaries(shifts, transactions);
+    const reconciliationByShiftId = new Map(reconciliations.map((reconciliation) => [reconciliation.shiftId, reconciliation]));
+    shifts = shifts.map((shift) => {
+      const reconciliation = reconciliationByShiftId.get(shift.id);
+      if (!reconciliation) return shift;
+
+      const expectedCash = Number(reconciliation.expectedCash ?? shift.totalExpectedCash ?? 0);
+      const actualCash = Number(reconciliation.totalActualCash ?? (shift as any).closingCash ?? shift.actualCashCount ?? 0);
+      const cashVariance = Number(reconciliation.cashVariance ?? (actualCash - expectedCash));
+
+      return {
+        ...shift,
+        totalExpectedCash: expectedCash,
+        actualCashCount: actualCash,
+        closingCash: actualCash,
+        cashVariance,
+      };
+    });
+    const activeShiftIds = new Set(shifts.filter((shift) => shift.status === 'Active').map((shift) => shift.id));
+    users = users.map((user) => ({
+      ...user,
+      currentShiftId: activeShiftIds.has(user.currentShiftId ?? '') ? user.currentShiftId : null,
+    }));
+    return shifts;
+  };
+  let reconciliations: ThreeWayReconciliation[] = ((allData.reconciliations as any[]) ?? []).map(normalizeStoredReconciliation);
+  let deliveries: FuelDelivery[] = ((allData.deliveries as any[]) ?? []).map(normalizeStoredDelivery);
+
+  let approvals: ManagerApproval[] = (allData.approvals as ManagerApproval[]) ?? [];
+  try {
+    const sqlite = getSqlite();
+    const storedApprovals = sqlite.prepare('SELECT * FROM manager_approvals ORDER BY created_at DESC').all() as any[];
+    if (storedApprovals.length > 0) {
+      approvals = storedApprovals.map((row: any) => ({
+        id: row.id,
+        timestamp: row.timestamp,
+        shiftId: row.shift_id ?? undefined,
+        type: row.type,
+        requestedBy: row.requested_by,
+        reason: row.reason,
+        amountOrQty: row.amount_or_qty,
+        status: row.status,
+        managerId: row.manager_id ?? undefined,
+        managerNotes: row.manager_notes ?? undefined,
+      })) as ManagerApproval[];
+    }
+  } catch (error) {
+    // Table might not exist yet; ignore
+  }
+
+  let auditLogs: AuditLog[] = (allData.auditLogs as AuditLog[]) ?? [];
+  const normalizeStationSettings = (value: Partial<StationSettings> | null | undefined): StationSettings => ({
+    stationName: String(value?.stationName ?? 'DT-FMS Station'),
+    tagline: String(value?.tagline ?? ''),
+    taxPin: String(value?.taxPin ?? ''),
+    address: String(value?.address ?? ''),
+    phone: String(value?.phone ?? ''),
+    email: String(value?.email ?? ''),
+    invoiceTerms: String(value?.invoiceTerms ?? ''),
+    paybillNumber: String(value?.paybillNumber ?? ''),
+    paybillAccountNumber: String(value?.paybillAccountNumber ?? ''),
+    tillNumber: String(value?.tillNumber ?? ''),
+    showPaybillOnInvoice: value?.showPaybillOnInvoice ?? true,
+    showTillOnInvoice: value?.showTillOnInvoice ?? false,
+  });
+
+  let stationSettings: StationSettings = normalizeStationSettings(allData.settings as Partial<StationSettings> | null | undefined);
+  let creditNotes: CreditNote[] = ((allData.creditNotes as CreditNote[]) ?? []).map(normalizeStoredCreditNote);
+  repairLegacyCreditNoteReferences();
+  let customers: CustomerAccount[] = ((allData.customers as CustomerAccount[]) ?? []).map(normalizeCustomerRecord);
+  let cashFlow: CashFlowRecord[] = ((allData.cashFlow as any[]) ?? []).map(normalizeStoredCashFlow);
+  let suppliers: SupplierAccount[] = ((allData.suppliers as SupplierAccount[]) ?? []).map(normalizeSupplierRecord);
+  let supplierPayments: SupplierPayment[] = (allData.supplierPayments as SupplierPayment[]) ?? [];
+  let stockAdjustments: StockAdjustment[] = normalizeStockAdjustmentsFromDatabase(allData.stockAdjustments as any[]);
+
+  const restoreActiveShiftState = () => {
+    const activeShifts = shifts.filter((shift) => shift.status === 'Active');
+
+    for (const user of users) {
+      const activeShift = activeShifts.find((shift) => shift.staffId === user.id);
+      user.currentShiftId = activeShift ? activeShift.id : null;
+
+      try {
+        db.userQueries.update(user.id, { currentShiftId: user.currentShiftId } as any);
+      } catch (error) {
+        console.warn(`Could not restore current shift for ${user.name}:`, error);
+      }
+    }
+  };
+
+  hydrateShiftSummaries();
+  restoreActiveShiftState();
+
+  const addAuditLog = db.addAuditLog;
+
+  const getNextDocumentSequence = (documentType: 'invoice' | 'receipt' | 'credit-note') => {
+    const sqlite = getSqlite();
+    const year = new Date().getFullYear();
+    const existing = sqlite.prepare('SELECT last_number, updated_at FROM document_counters WHERE document_type = ?').get(documentType) as { last_number: number; updated_at: string } | undefined;
+    const lastYear = existing?.updated_at ? new Date(existing.updated_at).getFullYear() : null;
+    const nextNumber = Number(existing?.last_number ?? 0) + 1;
+
+    if (!existing || lastYear !== year) {
+      sqlite.prepare(`
+        INSERT INTO document_counters (document_type, last_number, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(document_type)
+        DO UPDATE SET last_number = excluded.last_number, updated_at = CURRENT_TIMESTAMP
+      `).run(documentType, 1);
+      return 1;
+    }
+
+    sqlite.prepare(`
+      INSERT INTO document_counters (document_type, last_number, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(document_type)
+      DO UPDATE SET last_number = excluded.last_number, updated_at = CURRENT_TIMESTAMP
+    `).run(documentType, nextNumber);
+
+    return nextNumber;
+  };
+
+  const generateInvoiceNumber = () => {
+    const seq = getNextDocumentSequence('invoice');
+    const year = new Date().getFullYear();
+    return `Inv-${year}-${String(seq).padStart(4, '0')}`;
+  };
+
+  const generateReceiptNumber = () => {
+    const seq = getNextDocumentSequence('receipt');
+    const year = new Date().getFullYear();
+    return `Rcpt-${year}-${String(seq).padStart(4, '0')}`;
+  };
+
+  const generateCreditNoteNumber = () => {
+    const seq = getNextDocumentSequence('credit-note');
+    const year = new Date().getFullYear();
+    return `Cn-${year}-${String(seq).padStart(4, '0')}`;
+  };
+
+  const getSupplierName = (supplier: any) => String(supplier?.name ?? supplier?.supplierName ?? '').trim();
+  const normalizeSupplierName = (name: string) => String(name || '').trim().toLowerCase();
+  const normalizeTaxId = (value?: string | null) => String(value || '').trim().toUpperCase();
+  const findSupplierByName = (name: string) => {
+    const target = normalizeSupplierName(name);
+    return suppliers.find((supplier) => normalizeSupplierName(getSupplierName(supplier)) === target);
+  };
+  const resolveRegisteredSupplier = (supplierIdOrName?: string) => {
+    const rawValue = String(supplierIdOrName || '').trim();
+    if (!rawValue) return null;
+
+    const byId = suppliers.find((supplier) => supplier.id === rawValue);
+    if (byId) return byId;
+
+    return findSupplierByName(rawValue);
+  };
+  const getSupplierOutstandingBalance = (supplierId: string) => {
+    const supplier = suppliers.find((item) => item.id === supplierId);
+    if (!supplier) return 0;
+
+    const supplierName = getSupplierName(supplier);
+    const deliveriesTotal = deliveries
+      .filter((delivery) => normalizeSupplierName(delivery.supplierName) === normalizeSupplierName(supplierName))
+      .reduce((sum, delivery) => sum + Number(delivery.totalCost || 0), 0);
+
+    const paymentsTotal = supplierPayments
+      .filter((payment) => payment.supplierId === supplierId)
+      .reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+
+    return Math.max(0, deliveriesTotal - paymentsTotal);
+  };
+
+  const refreshSupplierBalancesFromHistory = () => {
+    suppliers = suppliers.map((supplier) => {
+      const derivedBalance = getSupplierOutstandingBalance(supplier.id);
+      const updatedSupplier = { ...supplier, currentBalance: derivedBalance };
+
+      try {
+        db.supplierQueries.update(supplier.id, { accountBalance: derivedBalance } as any);
+      } catch (error) {
+        console.error('Error syncing supplier balance to database:', error);
+      }
+
+      return updatedSupplier;
+    });
+  };
+
+  refreshSupplierBalancesFromHistory();
+
+  type AuthenticatedSession = { userId: string; expiresAt: number };
+  const sessions = new Map<string, AuthenticatedSession>();
+  const parseCookies = (cookieHeader?: string) => Object.fromEntries(
+    String(cookieHeader || '').split(';').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+      const separator = entry.indexOf('=');
+      return [entry.slice(0, separator), decodeURIComponent(entry.slice(separator + 1))];
+    })
+  );
+  // These paths are no longer needed for the global middleware, but we keep them for reference.
+  const operationalMutationPaths = new Set([
+    '/sales',
+    '/shifts/clock-in',
+    '/reconciliations',
+    '/auth/change-pin',
+  ]);
+
+  // ======================================================================
+  // MIDDLEWARE – Authentication only; authorisation is per endpoint.
+  // ======================================================================
+  app.use('/api', (req: any, res, next) => {
+    if (req.path === '/auth/verify-pin') return next();
+    if (req.path === '/auth/bootstrap-status') return next();
+    if (req.path === '/auth/logout') return next();
+    if (req.path === '/status') return next();
+    if (req.path === '/users' && req.method === 'POST' && users.length === 0) return next();
+
+    const sessionId = parseCookies(req.headers.cookie).fms_session;
+    const session = sessionId ? sessions.get(sessionId) : null;
+    const authenticatedUser = session && session.expiresAt > Date.now()
+      ? getUserById(session.userId)
+      : null;
+
+    if (!authenticatedUser?.active) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication is required for this action.',
+      });
+    }
+
+    req.authUser = authenticatedUser;
+
+    // A first-login or reset PIN user receives a session solely to complete the
+    // PIN change. No protected business endpoint can be used in the interim.
+    if (requiresPasswordChange(authenticatedUser) && !['/auth/me', '/auth/change-pin', '/auth/logout'].includes(req.path)) {
+      return res.status(403).json({
+        success: false,
+        code: 'PIN_CHANGE_REQUIRED',
+        message: 'You must set a new PIN before accessing DT-FMS.',
+      });
+    }
+
+    if (req.body && typeof req.body === 'object') {
+      req.body.actorUserId = authenticatedUser.id;
+      req.body.actorRole = authenticatedUser.role;
+      req.body.userRole = authenticatedUser.role;
+      req.body.userName = authenticatedUser.name;
+    }
+
+    // ✅ We do NOT check authorisation here – each endpoint will enforce its own permission.
+    next();
+  });
+
+  // --- API ROUTES ---
+
+  app.get('/api/status', (req, res) => {
+    const dashboardSummary = buildDashboardSalesSummary(transactions, shifts);
+    res.json({
+      status: 'online',
+      system: 'DT-FMS (Fuel Management System)',
+      activeShiftsCount: dashboardSummary.activeStaff.count,
+      pendingApprovalsCount: approvals.filter((a) => a.status === 'Pending').length,
+      totalSalesToday: dashboardSummary.today.totalSales,
+    });
+  });
+
+  app.get('/api/auth/bootstrap-status', (_req, res) => {
+    res.json({ hasUsers: Number((getSqlite().prepare('SELECT COUNT(*) AS count FROM users').get() as any).count || 0) > 0 });
+  });
+
+  app.get('/api/dashboard-summary', (req, res) => {
+    res.json(buildDashboardSalesSummary(transactions, shifts));
+  });
+  app.get('/api/auth/me', (req: any, res) => {
+    try {
+      const cookies = parseCookies(req.headers.cookie);
+      const sessionId = cookies?.fms_session;
+
+      if (!sessionId) {
+        return res.status(401).json({
+          authenticated: false,
+        });
+      }
+
+      const session = sessions.get(sessionId);
+
+      if (!session || session.expiresAt <= Date.now()) {
+        return res.status(401).json({
+          authenticated: false,
+        });
+      }
+
+      const user = getUserById(session.userId);
+
+      if (!user || !user.active) {
+        return res.status(401).json({
+          authenticated: false,
+        });
+      }
+
+      return res.status(200).json({
+        authenticated: true,
+        // Always hydrate permissions from the authoritative database source.
+        user: toAuthenticatedUser(user),
+      });
+    } catch (error) {
+      console.error('Session restore error:', error);
+
+      return res.status(500).json({
+        authenticated: false,
+      });
+    }
+  });
+
+  app.post('/api/auth/verify-pin', (req, res) => {
+    const { userId, identifier, pin, requiredRoles } = req.body || {};
+    const normalizedIdentifier = String(identifier || '').trim().toLowerCase();
+    const user = userId
+      ? getUserById(String(userId))
+      : normalizedIdentifier
+        ? getSqlite().prepare(`SELECT * FROM users
+          WHERE lower(trim(email)) = ? OR lower(trim(name)) = ? OR lower(trim(COALESCE(username, ''))) = ?
+          LIMIT 1`).get(normalizedIdentifier, normalizedIdentifier, normalizedIdentifier) as User | undefined
+        : undefined;
+    const verification = user ? verifyStoredPin(user.pin, pin) : { valid: false, legacy: false };
+    if (!user || !user.active || !verification.valid) {
+      return res.status(401).json({ success: false, message: 'Invalid username or PIN.' });
+    }
+    if (verification.legacy) {
+      const upgradedPin = hashPin(String(pin));
+      db.userQueries.update(user.id, { pin: upgradedPin } as any);
+      user.pin = upgradedPin;
+      users = users.map((item) => item.id === user.id ? { ...item, pin: upgradedPin } : item);
+    }
+    if (requiredRoles && Array.isArray(requiredRoles) && !requiredRoles.includes(user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: `Action requires role: ${requiredRoles.join(' or ')}. Logged in as ${user.role}.`,
+      });
+    }
+
+    const sessionId = randomUUID();
+    sessions.set(sessionId, { userId: user.id, expiresAt: Date.now() + 8 * 60 * 60 * 1000 });
+    user.lastLogin = new Date().toISOString();
+    db.userQueries.update(user.id, { lastLogin: user.lastLogin } as any);
+    res.setHeader('Set-Cookie', `fms_session=${encodeURIComponent(sessionId)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`);
+    addAuditLog(user.id, user.name, user.role, 'LOGIN_SUCCEEDED', 'Auth', 'Authenticated session created.');
+    return res.json({ success: true, user: toAuthenticatedUser(user) });
+  });
+
+  app.post('/api/auth/logout', (req: any, res) => {
+    try {
+      const cookies = parseCookies(req.headers.cookie);
+      const sessionId = cookies ? cookies.fms_session : undefined;
+
+      if (sessionId && typeof sessions !== 'undefined') {
+        sessions.delete(sessionId);
+      }
+
+      res.setHeader('Set-Cookie', [
+        'fms_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+      ]);
+
+      return res.status(200).json({ success: true });
+    } catch (error) {
+      console.error('Logout handler crash caught:', error);
+
+      res.setHeader('Set-Cookie', 'fms_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+      return res.status(200).json({ success: true });
+    }
+  });
+
+  app.post('/api/auth/change-pin', (req: any, res) => {
+    const user = req.authUser as User | undefined;
+    const { currentPin, newPin } = req.body || {};
+    if (!user || !verifyStoredPin(user.pin, currentPin).valid) return res.status(401).json({ success: false, message: 'Current PIN is invalid.' });
+    if (!isValidPin(newPin)) return res.status(400).json({ success: false, message: 'PIN must be 4-6 digits.' });
+    if (String(currentPin) === String(newPin)) return res.status(400).json({ success: false, message: 'New PIN must differ from the current PIN.' });
+    const hashedPin = hashPin(String(newPin));
+    db.userQueries.update(user.id, { pin: hashedPin, mustChangePassword: false } as any);
+    users = users.map((item) => item.id === user.id ? { ...item, pin: hashedPin, mustChangePassword: false } : item);
+    for (const [sessionId, session] of sessions) if (session.userId === user.id) sessions.delete(sessionId);
+    addAuditLog(user.id, user.name, user.role, 'USER_PASSWORD_CHANGED', 'Auth', 'User changed their own password.');
+    res.setHeader('Set-Cookie', 'fms_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+    res.json({ success: true });
+  });
+
+  // Users
+  const isSuperAdmin = (role?: string) => role === 'Super Admin';
+  const isAdmin = (role?: string) => ['Super Admin', 'Admin'].includes(role || '');
+
+  app.get('/api/custom-roles', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'MANAGE_USERS', 'view custom roles');
+    if (roleCheck) return roleCheck;
+    const roles = getSqlite().prepare('SELECT name, description, active FROM custom_roles ORDER BY name COLLATE NOCASE').all().map((role: any) => ({
+      ...role,
+      active: Boolean(role.active),
+      permissions: getRolePermissions(role.name),
+    }));
+    res.json(roles);
+  });
+
+  app.post('/api/custom-roles', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'MANAGE_USERS', 'create custom roles');
+    if (roleCheck) return roleCheck;
+    const name = String(req.body?.name || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const permissions = [...new Set(Array.isArray(req.body?.permissions) ? req.body.permissions.map(String) : [])] as Permission[];
+    if (!name || name.length > 80) return res.status(400).json({ message: 'A role name of up to 80 characters is required.' });
+    if (['super admin', 'admin'].includes(name.toLowerCase())) return res.status(400).json({ message: 'System roles cannot be created as custom roles.' });
+    if (permissions.some((permission) => !PERMISSIONS.includes(permission))) return res.status(400).json({ message: 'Unknown permission requested.' });
+    if (permissions.some((permission) => restrictedPermissions.has(permission)) && !isSuperAdminRole(req.authUser.role)) return res.status(403).json({ message: 'Only Super Admin can include restricted permissions.' });
+    try {
+      getSqlite().transaction(() => {
+        getSqlite().prepare('INSERT INTO custom_roles (name, description, active, created_by) VALUES (?, ?, 1, ?)').run(name, description, req.authUser.id);
+        const insert = getSqlite().prepare('INSERT INTO custom_role_permissions (role_name, permission) VALUES (?, ?)');
+        permissions.forEach((permission) => insert.run(name, permission));
+      })();
+    } catch (error: any) { return res.status(409).json({ message: error?.message?.includes('UNIQUE') ? 'A role with this name already exists.' : 'Custom role could not be created.' }); }
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'ROLE_CREATED', 'Settings', `Created custom role ${name}.`);
+    res.status(201).json({ name, description, active: true, permissions });
+  });
+
+  app.put('/api/custom-roles/:name', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'MANAGE_USERS', 'edit custom roles');
+    if (roleCheck) return roleCheck;
+    const name = String(req.params.name || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const active = req.body?.active === undefined ? true : Boolean(req.body.active);
+    const permissions = [...new Set(Array.isArray(req.body?.permissions) ? req.body.permissions.map(String) : [])] as Permission[];
+    const existing = getSqlite().prepare('SELECT name FROM custom_roles WHERE name = ? COLLATE NOCASE').get(name);
+    if (!existing) return res.status(404).json({ message: 'Custom role not found.' });
+    if (permissions.some((permission) => !PERMISSIONS.includes(permission))) return res.status(400).json({ message: 'Unknown permission requested.' });
+    if (permissions.some((permission) => restrictedPermissions.has(permission)) && !isSuperAdminRole(req.authUser.role)) {
+      return res.status(403).json({ message: 'Only Super Admin can include restricted permissions.' });
+    }
+    const previousPermissions = getRolePermissions(name);
+    getSqlite().transaction(() => {
+      getSqlite().prepare('UPDATE custom_roles SET description = ?, active = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ? COLLATE NOCASE').run(description, active ? 1 : 0, name);
+      getSqlite().prepare('DELETE FROM custom_role_permissions WHERE role_name = ? COLLATE NOCASE').run(name);
+      const insert = getSqlite().prepare('INSERT INTO custom_role_permissions (role_name, permission) VALUES (?, ?)');
+      permissions.forEach((permission) => insert.run(name, permission));
+    })();
+    const added = permissions.filter((permission) => !previousPermissions.includes(permission));
+    const removed = previousPermissions.filter((permission) => !permissions.includes(permission));
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'ROLE_UPDATED', 'Settings', `Updated role ${name}; added: ${added.join(', ') || 'none'}; removed: ${removed.join(', ') || 'none'}; active: ${active}.`);
+    res.json({ name, description, active, permissions });
+  });
+
+  app.get('/api/users', (req, res) => {
+    const actor = (req as any).authUser as User | undefined;
+    if (!actor) return res.status(401).json({ message: 'Authentication is required to view users.' });
+    if (!hasPermission(actor, 'MANAGE_USERS')) {
+      return res.status(403).json({ message: 'Unauthorized access to user list.' });
+    }
+    res.json(users.map((user) => ({ ...user, pin: undefined, permissions: getEffectivePermissions(user) })));
+  });
+
+  app.get('/api/users/:id/permissions', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'MANAGE_USERS', 'view user permissions');
+    if (roleCheck) return roleCheck;
+    if (!users.some((user) => user.id === req.params.id)) return res.status(404).json({ message: 'User not found.' });
+    const user = users.find((entry) => entry.id === req.params.id)!;
+    const directPermissions = getPermissions(user.id);
+    const rolePermissions = getRolePermissions(user.role);
+    const overrides = Object.fromEntries(getPermissionOverrides(user.id));
+    res.json({
+      userId: req.params.id,
+      permissions: [...new Set([...directPermissions, ...rolePermissions])],
+      directPermissions,
+      rolePermissions,
+      overrides,
+    });
+  });
+
+  app.put('/api/users/:id/permissions', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'MANAGE_USERS', 'manage user permissions');
+    if (roleCheck) return roleCheck;
+    const target = users.find((user) => user.id === req.params.id);
+    const requestedPermissions = Array.isArray(req.body?.permissions) ? [...new Set(req.body.permissions.map(String))] : [];
+    const validPermissions = new Set<Permission>(PERMISSIONS);
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+    if (target.role === 'Super Admin') return res.status(403).json({ message: 'Super Admin permissions are role-derived and cannot be changed.' });
+    if (requestedPermissions.some((permission) => !validPermissions.has(permission as Permission))) return res.status(400).json({ message: 'Unknown permission requested.' });
+    const inheritedRolePermissions = getRolePermissions(target.role);
+    // The editor submits the desired effective set. Role grants stay on the role;
+    // explicit removals are persisted as per-user deny overrides.
+    const requestedDirectPermissions = requestedPermissions.filter(
+      (permission) => !inheritedRolePermissions.includes(permission as Permission)
+    );
+    if (requestedDirectPermissions.some((permission) => restrictedPermissions.has(permission as Permission)) && !isSuperAdminRole(req.authUser.role)) {
+      return res.status(403).json({ message: 'Only Super Admin can grant or revoke restricted system permissions.' });
+    }
+    const now = new Date().toISOString();
+    getSqlite().transaction(() => {
+      getSqlite().prepare('DELETE FROM user_permissions WHERE user_id = ?').run(target.id);
+      getSqlite().prepare('DELETE FROM user_permission_overrides WHERE user_id = ?').run(target.id);
+      const insert = getSqlite().prepare('INSERT INTO user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?)');
+      requestedDirectPermissions.forEach((permission) => insert.run(target.id, permission, req.authUser.id, now));
+      const insertOverride = getSqlite().prepare('INSERT INTO user_permission_overrides (user_id, permission, granted, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)');
+      inheritedRolePermissions
+        .filter((permission) => !requestedPermissions.includes(permission))
+        .forEach((permission) => insertOverride.run(target.id, permission, 0, req.authUser.id, now));
+    })();
+    const deniedRolePermissions = inheritedRolePermissions.filter((permission) => !requestedPermissions.includes(permission));
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'USER_PERMISSION_UPDATED', 'Settings', `Updated ${target.name}; direct grants: ${requestedDirectPermissions.join(', ') || 'none'}; role overrides removed: ${deniedRolePermissions.join(', ') || 'none'}.`);
+    res.json({
+      userId: target.id,
+      permissions: getEffectivePermissions(target),
+      directPermissions: getPermissions(target.id),
+      rolePermissions: inheritedRolePermissions,
+      overrides: Object.fromEntries(getPermissionOverrides(target.id)),
+    });
+  });
+
+  app.post('/api/users', (req, res) => {
+    const actorUserId = String(req.body.actorUserId || '');
+    const actorRole = String(req.body.actorRole || '');
+    const isFirstUser = users.length === 0;
+    const requestedRole = String(req.body.role || 'Admin');
+    const normalizedRole = requestedRole === 'super-admin' ? 'Admin' : requestedRole;
+    const submittedName = String(req.body.name || '').trim();
+    const submittedEmail = String(req.body.email || '').trim().toLowerCase();
+    const submittedUsername = String(req.body.username || '').trim();
+
+    if (!isValidPin(req.body.pin)) return res.status(400).json({ message: 'PIN must be 4-6 digits.' });
+
+    if (!isFirstUser && !hasPermission((req as any).authUser, 'CREATE_USER')) {
+      return res.status(403).json({ message: 'Permission required: CREATE_USER.' });
+    }
+
+    if (submittedName && users.some((user) => user.name.trim().toLowerCase() === submittedName.toLowerCase())) {
+      return res.status(409).json({ message: 'A user with this name already exists.' });
+    }
+
+    if (submittedEmail && users.some((user) => user.email.trim().toLowerCase() === submittedEmail)) {
+      return res.status(409).json({ message: 'A user with this email already exists.' });
+    }
+
+    if (submittedUsername && users.some((user) => String(user.username || user.email).trim().toLowerCase() === submittedUsername.toLowerCase())) {
+      return res.status(409).json({ message: 'A user with this username already exists.' });
+    }
+
+    if (isFirstUser) {
+      const newUser: User = {
+        id: 'usr-' + Date.now(),
+        ...req.body,
+        name: submittedName,
+        username: submittedUsername || submittedEmail.split('@')[0],
+        email: submittedEmail,
+        phone: String(req.body.phone || '').trim(),
+        role: 'Super Admin',
+        pin: hashPin(String(req.body.pin || '')),
+        active: true,
+        mustChangePassword: false,
+        status: 'Active',
+        createdAt: new Date().toISOString(),
+      } as User;
+
+      users.push(newUser);
+
+      try {
+        db.userQueries.create(newUser as any);
+      } catch (error) {
+        console.error('Error saving user to database:', error);
+      }
+
+      addAuditLog('sys', 'System Admin', 'Super Admin', 'USER_CREATED', 'Settings', `Created first user ${newUser.name} as Super Admin.`);
+      return res.json(toAuthenticatedUser(newUser));
+    }
+
+    if (normalizedRole === 'Super Admin' && (req as any).authUser?.role !== 'Super Admin') {
+      return res.status(403).json({ message: 'Only a Super Admin can create a Super Admin user.' });
+    }
+    if (!isAssignableRole(normalizedRole)) {
+      return res.status(400).json({ message: 'Select an active, configured role.' });
+    }
+
+    const newUser: User = {
+      id: 'usr-' + Date.now(),
+      ...req.body,
+      name: submittedName,
+      username: submittedUsername || submittedEmail.split('@')[0],
+      email: submittedEmail,
+      phone: String(req.body.phone || '').trim(),
+      role: normalizedRole as User['role'],
+      pin: hashPin(String(req.body.pin || '')),
+      active: true,
+      mustChangePassword: true,
+      status: 'Active',
+      createdAt: new Date().toISOString(),
+    } as User;
+
+    users.push(newUser);
+
+    try {
+      db.userQueries.create(newUser as any);
+    } catch (error) {
+      console.error('Error saving user to database:', error);
+    }
+
+    addAuditLog(actorUserId || 'sys', actorRole || 'Admin', actorRole || 'Admin', 'USER_CREATED', 'Settings', `Created user ${newUser.name} (${newUser.role})`);
+    res.json(toAuthenticatedUser(newUser));
+  });
+
+  app.put('/api/users/:id', (req, res) => {
+    const { id } = req.params;
+    const actor = (req as any).authUser as User;
+    const target = users.find((u) => u.id === id);
+
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+    if (!hasPermission(actor, 'MANAGE_USERS')) return res.status(403).json({ message: 'Permission required: MANAGE_USERS.' });
+    if (target.role === 'Super Admin' && actor.role !== 'Super Admin') return res.status(403).json({ message: 'Admins cannot modify Super Admin data.' });
+    if (String(req.body.role || target.role) === 'Super Admin' && actor.role !== 'Super Admin') return res.status(403).json({ message: 'Only Super Admin can assign Super Admin role.' });
+    if (req.body.role !== undefined && !isAssignableRole(String(req.body.role))) {
+      return res.status(400).json({ message: 'Select an active, configured role.' });
+    }
+
+    const updatedUser = {
+      ...target,
+      ...req.body,
+      pin: target.pin,
+      name: String(req.body.name || target.name).trim(),
+      email: String(req.body.email || target.email).trim(),
+      phone: String(req.body.phone || target.phone).trim(),
+      username: req.body.username ? String(req.body.username).trim() : target.username,
+      role: String(req.body.role || target.role) as User['role'],
+      active: req.body.active !== undefined ? Boolean(req.body.active) : target.active,
+      status: req.body.status || target.status || (target.active ? 'Active' : 'Inactive'),
+    } as User;
+
+    const normalizedEmail = updatedUser.email.toLowerCase();
+    const normalizedUsername = String(updatedUser.username || '').trim().toLowerCase();
+    if (users.some((user) => user.id !== id && user.email.trim().toLowerCase() === normalizedEmail)) return res.status(409).json({ message: 'A user with this email already exists.' });
+    if (normalizedUsername && users.some((user) => user.id !== id && String(user.username || '').trim().toLowerCase() === normalizedUsername)) return res.status(409).json({ message: 'A user with this username already exists.' });
+    const changedFields = ['name', 'username', 'email', 'phone', 'role', 'active']
+      .filter((field) => String((target as any)[field] ?? '') !== String((updatedUser as any)[field] ?? ''));
+
+    users = users.map((u) => u.id === id ? updatedUser : u);
+    db.userQueries.update(id, updatedUser as any);
+    if (!updatedUser.active) for (const [sessionId, session] of sessions) if (session.userId === id) sessions.delete(sessionId);
+    addAuditLog(actor.id, actor.name, actor.role, 'USER_UPDATED', 'Settings', `Updated ${updatedUser.name} (${updatedUser.id}); changed: ${changedFields.join(', ') || 'no persisted fields'}.`);
+    res.json(toAuthenticatedUser(updatedUser));
+  });
+
+  app.post('/api/users/:id/reset-pin', (req, res) => {
+    const { id } = req.params;
+    const { newPin, actorUserId, actorRole } = req.body;
+
+    if (!hasPermission((req as any).authUser, 'RESET_USER_PASSWORD')) return res.status(403).json({ message: 'Permission required: RESET_USER_PASSWORD.' });
+    const target = users.find((u) => u.id === id);
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+    if (target.role === 'Super Admin' && actorRole !== 'Super Admin') return res.status(403).json({ message: 'Admins cannot reset a Super Admin password.' });
+    if (!newPin || !/^\d{4,6}$/.test(String(newPin))) return res.status(400).json({ message: 'PIN must be 4-6 digits.' });
+
+    target.pin = hashPin(String(newPin));
+    target.mustChangePassword = true;
+    db.userQueries.update(target.id, { pin: target.pin, mustChangePassword: true } as any);
+    for (const [sessionId, session] of sessions) if (session.userId === target.id) sessions.delete(sessionId);
+    addAuditLog(actorUserId || 'sys', actorRole || 'Admin', actorRole || 'Admin', 'USER_PASSWORD_RESET', 'Auth', `Password reset initiated for ${target.name}.`);
+    res.json(toAuthenticatedUser(target));
+  });
+
+  app.post('/api/users/:id/status', (req, res) => {
+    const { id } = req.params;
+    const { status, actorUserId, actorRole } = req.body;
+    const target = users.find((u) => u.id === id);
+
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+    if (!hasPermission((req as any).authUser, 'MANAGE_USERS')) return res.status(403).json({ message: 'Permission required: MANAGE_USERS.' });
+    if (target.role === 'Super Admin' && actorRole !== 'Super Admin') return res.status(403).json({ message: 'Admins cannot change Super Admin status.' });
+    if (id === actorUserId) return res.status(403).json({ message: 'You cannot deactivate your own account.' });
+
+    const nextStatus = String(status || 'Active') as User['status'];
+    const nextActive = nextStatus === 'Active';
+    target.status = nextStatus;
+    target.active = nextActive;
+    db.userQueries.update(target.id, { active: target.active } as any);
+    if (!nextActive) for (const [sessionId, session] of sessions) if (session.userId === target.id) sessions.delete(sessionId);
+
+    addAuditLog(actorUserId || 'sys', actorRole || 'Admin', actorRole || 'Admin', 'USER_STATUS_CHANGED', 'Settings', `Set ${target.name} to ${nextStatus}.`);
+    res.json(toAuthenticatedUser(target));
+  });
+
+  app.delete('/api/users/:id', (req, res) => {
+    const { id } = req.params;
+    const { actorUserId, actorRole } = req.body || {};
+    const target = users.find((u) => u.id === id);
+
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+    if (!hasPermission((req as any).authUser, 'MANAGE_USERS')) return res.status(403).json({ message: 'Permission required: MANAGE_USERS.' });
+    if (target.role === 'Super Admin') return res.status(403).json({ message: 'Super Admin accounts cannot be deleted.' });
+    if (id === actorUserId) return res.status(403).json({ message: 'You cannot delete your own account.' });
+
+    const relatedShift = shifts.some((shift) => shift.staffId === id);
+    const relatedTx = transactions.some((tx) => tx.staffId === id);
+    const relatedAudit = auditLogs.some((log) => log.userId === id || log.userName === target.name);
+
+    if (relatedShift || relatedTx || relatedAudit) {
+      users = users.map((u) => u.id === id ? { ...u, active: false, status: 'Inactive' } : u);
+      db.userQueries.update(id, { active: false } as any);
+      for (const [sessionId, session] of sessions) if (session.userId === id) sessions.delete(sessionId);
+      addAuditLog(actorUserId || 'sys', actorRole || 'Admin', actorRole || 'Admin', 'USER_DEACTIVATED', 'Settings', `Deactivated ${target.name} instead of deleting due to historical activity.`);
+      return res.json({ success: true, deactivated: true });
+    }
+
+    users = users.filter((u) => u.id !== id);
+    db.userQueries.delete(id);
+    addAuditLog(actorUserId || 'sys', actorRole || 'Admin', actorRole || 'Admin', 'USER_DELETED', 'Settings', `Deleted user ${target.name}.`);
+    res.json({ success: true, deleted: true });
+  });
+
+  // Tanks & Dip Readings
+  app.get('/api/tanks', (req, res) => {
+    res.json(tanks);
+  });
+
+  app.post('/api/tanks', (req, res) => {
+    const { tankName, fuelProductId, fuelName, capacityLiters, currentLevelLiters, reorderLevelLiters, taxCode, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_PUMPS', 'Tank registration');
+    if (permCheck) return permCheck;
+
+    const normalizedFuelName = String(fuelName || '').trim();
+    const selectedTaxCode: TaxCode = normalizeTaxCode(taxCode);
+    if (!normalizedFuelName) {
+      return res.status(400).json({ message: 'Fuel product name is required when creating a tank.' });
+    }
+
+    let prod = products.find((p) => p.id === fuelProductId || p.name.toLowerCase() === normalizedFuelName.toLowerCase() || p.code.toLowerCase() === normalizedFuelName.toLowerCase());
+
+    if (!prod) {
+      const partialMatch = products.find((p) => {
+        const productName = String(p.name || '').toLowerCase();
+        const productCode = String(p.code || '').toLowerCase();
+        return productName.includes(normalizedFuelName.toLowerCase()) || normalizedFuelName.toLowerCase().includes(productName) || productCode.includes(normalizedFuelName.toLowerCase()) || normalizedFuelName.toLowerCase().includes(productCode);
+      });
+      prod = partialMatch || null;
+    }
+
+    if (!prod) {
+      const safeCodeBase = normalizedFuelName
+        .replace(/[^a-zA-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toUpperCase() || `FUEL-${Date.now()}`;
+
+      const lowerFuelName = normalizedFuelName.toLowerCase();
+      const isDiesel = /(diesel|ago|gasoil)/.test(lowerFuelName);
+      const isPetrol = /(petrol|gasoline|premium|unl|super)/.test(lowerFuelName);
+      const defaultCost = isDiesel ? 145 : isPetrol ? 170 : 150;
+      const defaultPrice = isDiesel ? defaultCost + 15 : isPetrol ? defaultCost + 18 : defaultCost + 12;
+      const productTaxRate = getTaxRateByCode(selectedTaxCode);
+
+      prod = {
+        id: 'prod-' + Date.now(),
+        code: `${safeCodeBase}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
+        name: normalizedFuelName,
+        pricePerLiter: defaultPrice,
+        costPerLiter: defaultCost,
+        taxRate: productTaxRate,
+        taxCode: selectedTaxCode,
+        unit: 'L',
+        color: '#10b981',
+      };
+
+      products.push(prod);
+
+      try {
+        db.productQueries.create({
+          ...prod,
+          taxCode: String(prod.taxCode ?? selectedTaxCode).toUpperCase(),
+        } as any);
+      } catch (error) {
+        console.error('Error creating product for tank registration:', error);
+      }
+    }
+
+    const newTank: FuelTank = {
+      id: 'tnk-' + Date.now(),
+      tankName: tankName || `Tank ${tanks.length + 1}`,
+      fuelProductId: prod.id,
+      fuelName: prod.name,
+      capacityLiters: Number(capacityLiters || 30000),
+      currentLevelLiters: Number(currentLevelLiters || 10000),
+      reorderLevelLiters: Number(reorderLevelLiters || 5000),
+      lastDipReading: Number(currentLevelLiters || 10000),
+      lastDipTime: new Date().toISOString(),
+    };
+
+    tanks.push(newTank);
+
+    try {
+      db.tankQueries.create(newTank as any);
+    } catch (error) {
+      console.error('Error saving tank to database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'TANK_REGISTERED', 'Tanks', `Registered new station fuel tank: ${newTank.tankName} (${newTank.fuelName}, ${newTank.capacityLiters} L capacity).`);
+    res.json(newTank);
+  });
+
+  app.delete('/api/tanks/:id', (req, res) => {
+    const { id } = req.params;
+    const { userId, userName, userRole } = req.body || {};
+
+    const permCheck = requirePermission(req, res, 'MANAGE_PUMPS', 'Tank deletion');
+    if (permCheck) return permCheck;
+
+    const tankIndex = tanks.findIndex((t) => t.id === id);
+    if (tankIndex === -1) {
+      return res.status(404).json({ message: 'Tank not found.' });
+    }
+
+    const tank = tanks[tankIndex];
+    const relatedPumps = pumps.filter((pump) => pump.tankId === id);
+
+    pumps = pumps.filter((pump) => pump.tankId !== id);
+    tanks.splice(tankIndex, 1);
+
+    try {
+      const sqlite = getSqlite();
+      deleteTankAndLinkedRecords(sqlite, id);
+    } catch (error) {
+      console.error('Error deleting tank and linked pumps from database:', error);
+    }
+
+    addAuditLog(
+      userId || 'sys',
+      userName || 'System',
+      userRole || 'Admin',
+      'TANK_DELETED',
+      'Tanks',
+      `Deleted tank ${tank.tankName} and ${relatedPumps.length} linked pump(s).`
+    );
+
+    res.json({ success: true, deletedTank: tank, deletedPumps: relatedPumps });
+  });
+
+  app.post('/api/tanks/dip', (req: any, res) => {
+    const { tankId, dipReadingLiters } = req.body;
+    if (!req.authUser) return res.status(401).json({ message: 'Authentication is required to record a tank dip.' });
+    const tank = tanks.find((t) => t.id === tankId);
+    if (!tank) return res.status(404).json({ message: 'Tank not found' });
+    const activeShift = db.shiftQueries.active().find((shift: any) => shift.staffId === req.authUser.id);
+    if (!activeShift) return res.status(409).json({ message: 'An active shift is required to record a tank dip observation.' });
+    const reportedValue = Number(dipReadingLiters);
+    if (!Number.isFinite(reportedValue) || reportedValue < 0) return res.status(400).json({ message: 'Dip reading must be a non-negative number.' });
+    const authoritativeValue = Number(tank.currentLevelLiters ?? 0);
+    const variance = reportedValue - authoritativeValue;
+    const recordedAt = new Date().toISOString();
+    let varianceId: string | null = null;
+    if (Math.abs(variance) > 0.000001) {
+      varianceId = `variance-${randomUUID()}`;
+      getSqlite().prepare(`INSERT INTO reading_variances
+        (id, shift_id, reading_type, tank_id, nozzle_id, reported_value, authoritative_value, variance, status, recorded_by, recorded_at)
+        VALUES (?, ?, 'Tank Dip', ?, NULL, ?, ?, ?, 'Review Required', ?, ?)`)
+        .run(varianceId, activeShift.id, tankId, reportedValue, authoritativeValue, variance, req.authUser.id, recordedAt);
+    }
+
+    addAuditLog(
+      req.authUser.id,
+      req.authUser.name,
+      req.authUser.role,
+      'DIP_READING_RECORDED',
+      'Tanks',
+      `Shift ${activeShift.id}, tank ${tank.id}: reported ${reportedValue} L, authoritative ${authoritativeValue} L, variance ${variance} L. No inventory adjustment was made.`
+    );
+    if (varianceId) addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'DIP_VARIANCE_DETECTED', 'Tanks', `Shift ${activeShift.id}, tank ${tank.id}: variance ${variance} L.`, 'Warning');
+
+    res.json({ ...tank, observation: { shiftId: activeShift.id, reportedValue, authoritativeValue, variance, recordedAt }, varianceId });
+  });
+
+  // Fuel Deliveries
+  app.get('/api/deliveries', (req, res) => {
+    res.json(deliveries);
+  });
+
+  app.post('/api/deliveries', (req, res) => {
+    const { tankId, supplierId, supplierName, deliveryNoteNo, litersReceived, costPerLiter, driverName, truckPlate, receivedBy, userId, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'ADJUST_STOCK', 'Fuel delivery logging');
+    if (permCheck) return permCheck;
+
+    const tank = tanks.find((t) => t.id === tankId);
+    if (!tank) return res.status(404).json({ message: 'Tank not found' });
+
+    const suppliedSupplierId = String(supplierId || '').trim();
+    const supplierDisplayName = String(supplierName || '').trim();
+    const liters = Number(litersReceived);
+    const unitPrice = Number(costPerLiter);
+
+    let supplierMatch: SupplierAccount | undefined;
+    if (suppliedSupplierId) {
+      supplierMatch = suppliers.find((supplier) => supplier.id === suppliedSupplierId);
+    }
+    if (!supplierMatch && supplierDisplayName) {
+      supplierMatch = findSupplierByName(supplierDisplayName);
+    }
+
+    if (!supplierMatch) {
+      return res.status(400).json({
+        message: 'Supplier must be registered before logging a delivery. Please create the supplier account from Suppliers & OMCs first.',
+      });
+    }
+
+    if (!deliveryNoteNo || String(deliveryNoteNo).trim() === '') {
+      return res.status(400).json({ message: 'Delivery note number is required.' });
+    }
+
+    if (!Number.isFinite(liters) || liters <= 0) {
+      return res.status(400).json({ message: 'Liters received must be greater than zero.' });
+    }
+
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      return res.status(400).json({ message: 'Cost per liter must be greater than zero.' });
+    }
+
+    const verifiedSupplierId = supplierMatch.id;
+    const verifiedSupplierName = getSupplierName(supplierMatch);
+
+    const dbSupplierExists = !!db.supplierQueries.byId(verifiedSupplierId);
+    if (!dbSupplierExists) {
+      db.supplierQueries.create({
+        id: verifiedSupplierId,
+        supplierName: verifiedSupplierName,
+        contactPerson: supplierMatch.contactPerson || verifiedSupplierName,
+        email: supplierMatch.email ?? null,
+        phone: supplierMatch.phone || '0000000000',
+        address: supplierMatch.address ?? null,
+        paymentTerms: supplierMatch.paymentTerms ?? null,
+        accountBalance: Number(supplierMatch.currentBalance ?? 0),
+        status: supplierMatch.status || 'Active',
+        taxId: supplierMatch.kraPin ?? null,
+        bankName: null,
+        bankAccount: null,
+      } as any);
+    }
+
+    const dbTankExists = !!db.tankQueries.byId(tank.id);
+    if (!dbTankExists) {
+      db.tankQueries.create({
+        id: tank.id,
+        tankName: tank.tankName,
+        fuelProductId: tank.fuelProductId,
+        fuelName: tank.fuelName,
+        capacityLiters: Number(tank.capacityLiters),
+        currentLevelLiters: Number(tank.currentLevelLiters),
+        reorderLevelLiters: Number(tank.reorderLevelLiters),
+        lastDipReading: Number(tank.lastDipReading ?? tank.currentLevelLiters),
+        lastDipTime: tank.lastDipTime || new Date().toISOString(),
+      } as any);
+    }
+
+    const productMatch = products.find((product) => product.id === tank.fuelProductId);
+    const dbProductExists = !!db.productQueries.byId(tank.fuelProductId);
+    if (!dbProductExists) {
+      const fallbackName = String(tank.fuelName || 'Fuel');
+      const lowerFuelName = fallbackName.toLowerCase();
+      const isDiesel = /(diesel|ago|gasoil)/.test(lowerFuelName);
+      const isPetrol = /(petrol|gasoline|premium|unl|super)/.test(lowerFuelName);
+      const defaultCost = isDiesel ? 145 : isPetrol ? 170 : 150;
+      const defaultPrice = isDiesel ? defaultCost + 15 : isPetrol ? defaultCost + 18 : defaultCost + 12;
+      const fallbackTaxCode: TaxCode = isDiesel ? 'B' : 'B';
+      const createdProduct: FuelProduct = {
+        id: tank.fuelProductId,
+        code: `${(tank.fuelName || 'FUEL').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toUpperCase() || 'FUEL'}-${Date.now()}`,
+        name: tank.fuelName || 'Fuel',
+        pricePerLiter: defaultPrice,
+        costPerLiter: defaultCost,
+        taxRate: getTaxRateByCode(fallbackTaxCode),
+        taxCode: fallbackTaxCode,
+        unit: 'L',
+        color: '#10b981',
+      };
+      products.push(createdProduct);
+      try {
+        db.productQueries.create(createdProduct as any);
+      } catch (error) {
+        console.error('Error creating product for tank fallback:', error);
+      }
+    }
+
+    if (productMatch) {
+      const currentCost = Number(productMatch.costPerLiter || 0);
+      const nextCost = Number(unitPrice || currentCost || productMatch.pricePerLiter || 0);
+      productMatch.costPerLiter = nextCost;
+      productMatch.pricePerLiter = Number(productMatch.pricePerLiter || nextCost || 0);
+
+      try {
+        db.productQueries.update(productMatch.id, {
+          name: productMatch.name,
+          code: productMatch.code,
+          pricePerLiter: Number(productMatch.pricePerLiter || nextCost),
+          costPerLiter: Number(nextCost),
+          taxRate: Number(productMatch.taxRate ?? 0.16),
+          unit: productMatch.unit ?? 'L',
+          color: productMatch.color ?? '#10b981',
+        } as any);
+      } catch (error) {
+        console.error('Error updating product cost from delivery:', error);
+      }
+    }
+
+    const validUserId = userId && users.some((user) => user.id === userId) ? userId : users[0]?.id || 'sys';
+    const openingLevel = tank.currentLevelLiters;
+    const closingLevel = openingLevel + liters;
+    tank.currentLevelLiters = closingLevel;
+    tank.lastDipReading = closingLevel;
+    tank.lastDipTime = new Date().toISOString();
+
+    try {
+      db.tankQueries.update(tank.id, {
+        currentLevelLiters: tank.currentLevelLiters,
+        lastDipReading: tank.lastDipReading,
+        lastDipTime: tank.lastDipTime,
+      } as any);
+    } catch (error) {
+      console.error('Error saving delivered tank level to database:', error);
+      return res.status(500).json({ message: 'Delivery could not update the tank inventory.' });
+    }
+
+    createStockAdjustmentRecord({
+      type: 'Fuel',
+      itemId: tank.id,
+      itemName: tank.tankName,
+      itemCode: productMatch?.code || tank.fuelProductId,
+      previousQty: openingLevel,
+      newQty: closingLevel,
+      reason: 'Fuel Delivery',
+      userId: validUserId,
+      userName: receivedBy || 'Station Staff',
+      userRole: userRole || 'Station Manager',
+      source: 'Pumps & Tanks',
+      referenceNumber: String(deliveryNoteNo).trim(),
+      originalDocumentNumber: String(deliveryNoteNo).trim(),
+      movementType: 'FUEL DELIVERY',
+      notes: `Fuel delivery received for ${tank.tankName}. Supplier: ${verifiedSupplierName}. Quantity added: ${liters} L.`,
+    });
+
+    const totalCost = liters * unitPrice;
+    supplierMatch.currentBalance = getSupplierOutstandingBalance(supplierMatch.id) + totalCost;
+    try {
+      db.supplierQueries.update(supplierMatch.id, {
+        accountBalance: supplierMatch.currentBalance,
+      } as any);
+    } catch (error) {
+      console.error('Error updating supplier outstanding balance after delivery:', error);
+    }
+    const newDelivery: FuelDelivery = {
+      id: 'del-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      supplierId: verifiedSupplierId,
+      tankId: tank.id,
+      tankName: tank.tankName,
+      supplierName: verifiedSupplierName,
+      deliveryNoteNo: String(deliveryNoteNo).trim(),
+      litersReceived: liters,
+      costPerLiter: unitPrice,
+      totalCost,
+      openingLevel,
+      closingLevel,
+      driverName: driverName || 'Driver',
+      truckPlate: truckPlate || 'KBB 120X',
+      receivedBy: receivedBy || 'Station Staff',
+    };
+
+    deliveries.unshift(newDelivery);
+
+    try {
+      db.deliveryQueries.create({
+        id: newDelivery.id,
+        supplierId: verifiedSupplierId,
+        supplierName: verifiedSupplierName,
+        tankId: tank.id,
+        fuelProductId: tank.fuelProductId,
+        quantity: liters,
+        unitPrice,
+        totalCost,
+        openingLevel,
+        closingLevel,
+        deliveryDate: new Date().toISOString().slice(0, 10),
+        deliveryTime: new Date().toISOString().slice(11, 19),
+        invoiceNumber: String(deliveryNoteNo).trim() || null,
+        driverName: driverName || 'Driver',
+        driverPhone: null,
+        vehicleReg: truckPlate || 'KBB 120X',
+        receivedBy: validUserId,
+        receivedByName: receivedBy || 'Station Staff',
+        status: 'Completed',
+        notes: `Delivery recorded for ${tank.tankName}`,
+      } as any);
+    } catch (error) {
+      console.error('Error saving fuel delivery to database:', error);
+      return res.status(500).json({ message: 'Delivery could not be saved to the database.' });
+    }
+
+    const actor = (req as any).authUser as User;
+    addAuditLog(
+      actor.id,
+      actor.name,
+      actor.role,
+      'FUEL_DELIVERY_RECEIVED',
+      'Tanks',
+      `Received fuel delivery ${String(deliveryNoteNo).trim()} from ${verifiedSupplierName}: ${liters} L to ${tank.tankName}. Inventory and supplier balance updated; no cash-flow entry is created until supplier payout.`
+    );
+
+    res.json({ delivery: newDelivery, updatedTank: tank });
+  });
+
+  // Pumps & Meter Readings
+  app.get('/api/pumps', (req: any, res) => {
+    // Pump/nozzle configuration is required by the POS terminal for every
+    // authenticated attendant. Keep the Pumps & Tanks tab itself protected by
+    // VIEW_PUMPS, but do not return 403 here or normal users cannot select a
+    // nozzle after clock-in.
+    if (!req.authUser) return res.status(401).json({ message: 'Authentication is required to view pump nozzles.' });
+    res.json(pumps);
+  });
+
+  app.get('/api/pump-units', (req: any, res) => {
+    const permCheck = requirePermission(req, res, 'VIEW_PUMPS', 'view physical pumps');
+    if (permCheck) return permCheck;
+    const pumpUnits = getSqlite().prepare(`
+      SELECT id, pump_number AS pumpNumber, pump_name AS pumpName, status
+      FROM pumps
+      ORDER BY pump_number
+    `).all();
+    res.json(pumpUnits);
+  });
+
+  app.get('/api/nozzle-readings', (req, res) => {
+    res.json(db.nozzleReadingQueries.all());
+  });
+
+  app.post('/api/pumps', (req, res) => {
+    const { pumpName, pumpNumber, tankId, openingMeterReading, nozzleConfigs, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_PUMPS', 'Pump registration');
+    if (permCheck) return permCheck;
+
+    const num = Number(pumpNumber || pumps.length + 1);
+    if (!Number.isInteger(num) || num <= 0) return res.status(400).json({ message: 'Pump number must be a positive whole number.' });
+    const requestedNozzles = Array.isArray(nozzleConfigs) && nozzleConfigs.length > 0
+      ? nozzleConfigs
+      : [{ tankId: tankId || tanks[0]?.id, openingMeterReading, nozzleName: 'Nozzle 1' }];
+    const nozzleNumbers = requestedNozzles.map((config: any, index: number) => Number(config.nozzleNumber ?? index + 1));
+    const invalidNozzle = nozzleNumbers.find((number) => !Number.isInteger(number) || number <= 0);
+    if (invalidNozzle !== undefined) return res.status(400).json({ message: 'Every nozzle number must be a positive whole number.' });
+    const duplicateNumbers = nozzleNumbers.filter((number, index) => nozzleNumbers.indexOf(number) !== index);
+    if (duplicateNumbers.length) return res.status(400).json({ message: `Duplicate nozzle numbers are not allowed for this pump: ${[...new Set(duplicateNumbers)].join(', ')}.` });
+    const invalidTankIndex = requestedNozzles.findIndex((config: any) => !tanks.some((tank) => tank.id === config.tankId));
+    if (invalidTankIndex >= 0) return res.status(400).json({ message: `Nozzle ${nozzleNumbers[invalidTankIndex]} must be linked to a valid source tank.` });
+    const newNozzles: PumpNozzle[] = requestedNozzles.map((config: any, index: number) => {
+      const sourceTank = tanks.find((tank) => tank.id === config.tankId);
+      if (!sourceTank) throw new Error(`Nozzle ${nozzleNumbers[index]} must be linked to a valid source tank.`);
+      const openingReading = Number(config.openingMeterReading ?? openingMeterReading ?? 0);
+      return {
+        id: `noz-${Date.now()}-${index + 1}`,
+        physicalPumpId: '',
+        nozzleNumber: nozzleNumbers[index],
+        nozzleName: String(config.nozzleName || `Nozzle ${nozzleNumbers[index]}`),
+        pumpNumber: num,
+        pumpName: pumpName || `Pump ${num}`,
+        tankId: sourceTank.id,
+        fuelProductId: sourceTank.fuelProductId,
+        fuelName: sourceTank.fuelName,
+        openingMeterReading: openingReading,
+        currentMeterReading: openingReading,
+        status: 'Active',
+      };
+    });
+
+    let physicalPumpId = '';
+    try {
+      const sqlite = getSqlite();
+      const pumpRecord = ensurePumpRecord(sqlite, null, num, pumpName || `Pump ${num}`);
+      physicalPumpId = pumpRecord.id;
+      newNozzles.forEach((nozzle) => {
+        nozzle.physicalPumpId = physicalPumpId;
+      });
+
+      sqlite.transaction(() => {
+        for (const nozzle of newNozzles) {
+          const existing = db.pumpQueries.findByPhysicalPumpAndNumber(physicalPumpId, nozzle.nozzleNumber) as any;
+          if (existing) {
+            // Configuration updates preserve nozzle identity and cumulative readings.
+            db.pumpQueries.update(existing.id, {
+              physicalPumpId,
+              nozzleNumber: nozzle.nozzleNumber,
+              nozzleName: nozzle.nozzleName,
+              pumpNumber: nozzle.pumpNumber,
+              pumpName: nozzle.pumpName,
+              tankId: nozzle.tankId,
+              fuelProductId: nozzle.fuelProductId,
+              fuelName: nozzle.fuelName,
+              status: 'Active',
+            } as any);
+            nozzle.id = existing.id;
+            nozzle.openingMeterReading = Number(existing.openingMeterReading);
+            nozzle.currentMeterReading = Number(existing.currentMeterReading);
+            continue;
+          }
+          db.pumpQueries.create(nozzle as any);
+          db.nozzleReadingQueries.create({
+            id: `nr-opening-${nozzle.id}`,
+            nozzleId: nozzle.id,
+            pumpId: physicalPumpId,
+            tankId: nozzle.tankId,
+            fuelProductId: nozzle.fuelProductId,
+            shiftId: null,
+            transactionId: null,
+            previousReading: nozzle.openingMeterReading,
+            quantityDispensed: 0,
+            currentReading: nozzle.currentMeterReading,
+            readingType: 'Opening',
+            recordedBy: userId || null,
+            timestamp: new Date().toISOString(),
+          } as any);
+        }
+        // Omitted nozzles are retired, not deleted, so historical dispensing and
+        // meter-reading relationships remain intact.
+        const submittedNumbers = newNozzles.map((nozzle) => nozzle.nozzleNumber);
+        const existingNozzles = sqlite.prepare('SELECT id, nozzle_number FROM pump_nozzles WHERE physical_pump_id = ? AND status != ?').all(physicalPumpId, 'Inactive') as any[];
+        existingNozzles.filter((nozzle) => !submittedNumbers.includes(Number(nozzle.nozzle_number))).forEach((nozzle) => {
+          sqlite.prepare("UPDATE pump_nozzles SET status = 'Inactive', updated_at = ? WHERE id = ?").run(new Date().toISOString(), nozzle.id);
+        });
+      })();
+    } catch (error) {
+      console.error('Error saving pump nozzles to database:', error);
+      return res.status(500).json({ message: error instanceof Error ? error.message : 'Pump configuration could not be saved.' });
+    }
+
+    const savedNozzleIds = new Set(newNozzles.map((nozzle) => nozzle.id));
+    pumps = pumps.filter((nozzle) => !savedNozzleIds.has(nozzle.id) && nozzle.physicalPumpId !== physicalPumpId).concat(newNozzles);
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'PUMP_REGISTERED', 'Tanks', `Registered ${newNozzles.length} nozzle(s) on ${pumpName || `Pump ${num}`}.`);
+    res.json(newNozzles[0]);
+  });
+
+  app.delete('/api/pumps/:id', (req, res) => {
+    const { id } = req.params;
+    const { userId, userName, userRole } = req.body || {};
+
+    const permCheck = requirePermission(req, res, 'DELETE_PUMP', 'Pump nozzle deletion');
+    if (permCheck) return permCheck;
+
+    const pumpIndex = pumps.findIndex((pump) => pump.id === id);
+    if (pumpIndex === -1) {
+      return res.status(404).json({ message: 'Pump nozzle not found.' });
+    }
+
+    const removedPump = pumps[pumpIndex];
+    const activeShift = shifts.find((shift) => shift.status === 'Active' && (shift.openingPumpReadings || []).some((reading) => reading.pumpId === id));
+    if (activeShift) {
+      return res.status(409).json({ message: `Cannot delete ${removedPump.nozzleName || 'this nozzle'} because it is part of the active shift for ${activeShift.staffName}. Clock out or close that shift first.` });
+    }
+
+    const historicalTransactions = transactions.filter((transaction: any) =>
+      transaction.nozzleId === id || transaction.pumpId === id || (transaction.items || []).some((item: any) => item.nozzleId === id || item.pumpId === id)
+    ).length;
+
+    try {
+      const sqlite = getSqlite();
+      sqlite.transaction(() => {
+        sqlite.prepare(`UPDATE pump_nozzles SET status = 'Inactive', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(id);
+      })();
+    } catch (error) {
+      console.error('Error deleting pump from database:', error);
+      return res.status(500).json({ message: 'Nozzle could not be removed from operations.' });
+    }
+
+    pumps[pumpIndex] = { ...removedPump, status: 'Inactive' };
+
+    addAuditLog(
+      userId || 'sys',
+      userName || 'System',
+      userRole || 'Admin',
+      'PUMP_DELETED',
+      'Tanks',
+      `Deleted ${removedPump.nozzleName || 'nozzle'} from ${removedPump.pumpName}. Tank: ${removedPump.tankId}. Fuel: ${removedPump.fuelName}. Historical transactions preserved (${historicalTransactions}).`
+    );
+
+    res.json({ success: true, deletedPump: removedPump, historicalTransactions });
+  });
+
+  app.delete('/api/pump-units/:id', (req, res) => {
+    const { id } = req.params;
+    const { userId, userName, userRole } = req.body || {};
+    const permCheck = requirePermission(req, res, 'DELETE_PUMP', 'Physical pump deletion');
+    if (permCheck) return permCheck;
+
+    const sqlite = getSqlite();
+    const pumpUnit = sqlite.prepare('SELECT id, pump_name, pump_number FROM pumps WHERE id = ? AND status != ?').get(id, 'Inactive') as any;
+    if (!pumpUnit) return res.status(404).json({ message: 'Physical pump not found.' });
+    const children = pumps.filter((nozzle) => nozzle.physicalPumpId === id && nozzle.status !== 'Inactive');
+    const blockingShift = shifts.find((shift) => shift.status === 'Active' && (shift.openingPumpReadings || []).some((reading) => children.some((nozzle) => nozzle.id === reading.pumpId)));
+    if (blockingShift) {
+      return res.status(409).json({ message: `Cannot delete ${pumpUnit.pump_name} because a child nozzle is part of the active shift for ${blockingShift.staffName}. Clock out or close that shift first.` });
+    }
+
+    const childIds = new Set(children.map((nozzle) => nozzle.id));
+    const historicalTransactions = transactions.filter((transaction: any) =>
+      childIds.has(transaction.nozzleId || '') || childIds.has((transaction as any).pumpId || '') || (transaction.items || []).some((item: any) => childIds.has(item.nozzleId || item.pumpId || ''))
+    ).length;
+
+    try {
+      sqlite.transaction(() => {
+        sqlite.prepare(`UPDATE pump_nozzles SET status = 'Inactive', updated_at = CURRENT_TIMESTAMP WHERE physical_pump_id = ?`).run(id);
+        sqlite.prepare(`UPDATE pumps SET status = 'Inactive', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(id);
+      })();
+    } catch (error) {
+      console.error('Error deleting physical pump:', error);
+      return res.status(500).json({ message: 'Physical pump could not be removed from operations.' });
+    }
+
+    pumps = pumps.map((nozzle) => nozzle.physicalPumpId === id ? { ...nozzle, status: 'Inactive' } : nozzle);
+    addAuditLog(userId || 'sys', userName || 'System', userRole || 'Admin', 'PUMP_UNIT_DELETED', 'Tanks', `Deleted ${pumpUnit.pump_name} and ${children.length} linked nozzle(s). Historical transactions preserved (${historicalTransactions}).`);
+    res.json({ success: true, deletedPumpUnit: id, childNozzleCount: children.length, historicalTransactions });
+  });
+
+  // Products & Fuel Prices
+  app.get('/api/products', (req, res) => {
+    res.json(products);
+  });
+
+  app.post('/api/products/price', (req, res) => {
+    const { productId, newPrice, taxCode, productName, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_PUMPS', 'Fuel price updates');
+    if (permCheck) return permCheck;
+
+    const prod = products.find((p) => p.id === productId);
+    if (!prod) return res.status(404).json({ message: 'Product not found' });
+
+    const oldPrice = prod.pricePerLiter;
+    const nextPrice = Number(newPrice);
+    const nextTaxCode: TaxCode = normalizeTaxCode(taxCode || prod.taxCode || 'B');
+    const nextTaxRate = getTaxRateByCode(nextTaxCode);
+    const nextName = String(productName || prod.name || '').trim();
+    prod.pricePerLiter = nextPrice;
+    prod.taxCode = nextTaxCode;
+    prod.taxRate = nextTaxRate;
+    if (nextName) {
+      prod.name = nextName;
+    }
+
+    try {
+      db.productQueries.update(prod.id, {
+        code: prod.code,
+        name: prod.name,
+        pricePerLiter: nextPrice,
+        costPerLiter: Number(prod.costPerLiter ?? 0),
+        taxRate: Number(nextTaxRate),
+        taxCode: nextTaxCode,
+        unit: prod.unit ?? 'L',
+        color: prod.color ?? 'emerald',
+      } as any);
+    } catch (error) {
+      console.error('Error updating product price in database:', error);
+    }
+
+    addAuditLog(
+      userId,
+      userName,
+      userRole,
+      'PRICE_CHANGE',
+      'Settings',
+      `Updated ${prod.name} fuel info: price KES ${oldPrice.toFixed(2)} → ${prod.pricePerLiter.toFixed(2)} / L, tax ${nextTaxCode}`,
+      'Warning'
+    );
+
+    res.json(prod);
+  });
+
+  app.put('/api/products/:id', (req, res) => {
+    const { id } = req.params;
+    const { name, code, pricePerLiter, costPerLiter, taxCode, taxRate, unit, color, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_PUMPS', 'Fuel product edits');
+    if (permCheck) return permCheck;
+
+    const productIndex = products.findIndex((p) => p.id === id);
+    if (productIndex === -1) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+
+    const existing = products[productIndex];
+    const nextName = String(name ?? existing.name).trim();
+    const nextCode = String(code ?? existing.code).trim();
+    const nextPrice = Number(pricePerLiter ?? existing.pricePerLiter ?? 0);
+    const nextCost = Number(costPerLiter ?? existing.costPerLiter ?? 0);
+    const nextTaxCode = normalizeTaxCode(String(taxCode ?? existing.taxCode ?? 'B'));
+    const nextTaxRate = Number(taxRate ?? getTaxRateByCode(nextTaxCode));
+
+    products[productIndex] = {
+      ...existing,
+      code: nextCode || existing.code,
+      name: nextName || existing.name,
+      pricePerLiter: nextPrice,
+      costPerLiter: nextCost,
+      taxCode: nextTaxCode,
+      taxRate: nextTaxRate,
+      unit: String(unit ?? existing.unit ?? 'L'),
+      color: String(color ?? existing.color ?? '#10b981'),
+    };
+
+    try {
+      db.productQueries.update(id, {
+        code: products[productIndex].code,
+        name: products[productIndex].name,
+        pricePerLiter: Number(products[productIndex].pricePerLiter ?? 0),
+        costPerLiter: Number(products[productIndex].costPerLiter ?? 0),
+        taxRate: Number(products[productIndex].taxRate ?? 0),
+        taxCode: products[productIndex].taxCode ?? 'B',
+        unit: products[productIndex].unit ?? 'L',
+        color: products[productIndex].color ?? '#10b981',
+      } as any);
+    } catch (error) {
+      console.error('Error updating product in database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'PRODUCT_UPDATED', 'Stock', `Updated fuel product ${products[productIndex].name} (${products[productIndex].code})`);
+    res.json(products[productIndex]);
+  });
+
+  app.delete('/api/products/:id', (req, res) => {
+    const { id } = req.params;
+    const { userId, userName, userRole } = req.body || {};
+    const permCheck = requirePermission(req, res, 'MANAGE_PUMPS', 'Fuel product deletion');
+    if (permCheck) return permCheck;
+
+    const productIndex = products.findIndex((p) => p.id === id);
+    if (productIndex === -1) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+
+    const [deletedProduct] = products.splice(productIndex, 1);
+    try {
+      const sqlite = getSqlite();
+      deleteProductAndLinkedRecords(sqlite, id);
+    } catch (error) {
+      console.error('Error deleting product from database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'PRODUCT_DELETED', 'Stock', `Deleted fuel product ${deletedProduct.name} (${deletedProduct.code})`);
+    res.json({ success: true, deletedProduct });
+  });
+
+  // Station & Invoice Settings
+  app.get('/api/settings', (req, res) => {
+    res.json(stationSettings);
+  });
+
+  app.post('/api/settings', (req, res) => {
+    const { settings, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_SETTINGS', 'Station settings updates');
+    if (permCheck) return permCheck;
+    stationSettings = normalizeStationSettings({ ...stationSettings, ...settings });
+
+    try {
+      db.settingsQueries.update({
+        id: 'station-1',
+        stationName: stationSettings.stationName,
+        tagline: stationSettings.tagline,
+        taxPin: stationSettings.taxPin,
+        address: stationSettings.address,
+        phone: stationSettings.phone,
+        email: stationSettings.email,
+        invoiceTerms: stationSettings.invoiceTerms,
+        paybillNumber: stationSettings.paybillNumber,
+        paybillAccountNumber: stationSettings.paybillAccountNumber,
+        tillNumber: stationSettings.tillNumber,
+        showPaybillOnInvoice: stationSettings.showPaybillOnInvoice,
+        showTillOnInvoice: stationSettings.showTillOnInvoice,
+      } as any);
+    } catch (error) {
+      console.error('Error updating station settings in database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'SETTINGS_UPDATED', 'Settings', `Updated Station & Invoice Header configuration.`);
+    res.json(stationSettings);
+  });
+
+  // Suppliers Management
+  app.get('/api/suppliers', (req, res) => {
+    res.json(suppliers.map(normalizeSupplierRecord));
+  });
+
+  app.post('/api/suppliers', (req, res) => {
+    const { id, name, contactPerson, phone, email, address, kraPin, paymentTerms, status, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_SUPPLIERS', 'Supplier management');
+    if (permCheck) return permCheck;
+    const normalizedName = normalizeSupplierName(name);
+    const normalizedPin = normalizeTaxId(kraPin);
+    if (!normalizedName) return res.status(400).json({ message: 'Supplier name is required.' });
+    if (suppliers.some((supplier) => supplier.id !== id && normalizeSupplierName(supplier.name) === normalizedName)) {
+      return res.status(409).json({ message: 'A supplier with this name already exists.' });
+    }
+    if (normalizedPin && suppliers.some((supplier) => supplier.id !== id && normalizeTaxId(supplier.kraPin) === normalizedPin)) {
+      return res.status(409).json({ message: 'A supplier with this KRA PIN already exists.' });
+    }
+
+    if (id) {
+      const existing = suppliers.find((s) => s.id === id);
+      if (existing) {
+        existing.name = String(name || existing.name).trim();
+        existing.contactPerson = contactPerson !== undefined ? contactPerson : existing.contactPerson;
+        existing.phone = phone || existing.phone;
+        existing.email = email !== undefined ? email : existing.email;
+        existing.address = address !== undefined ? address : existing.address;
+        existing.kraPin = kraPin !== undefined ? normalizedPin : existing.kraPin;
+        existing.paymentTerms = paymentTerms || existing.paymentTerms;
+        existing.status = status || existing.status;
+
+        try {
+          db.supplierQueries.update(existing.id, {
+            supplierName: existing.name,
+            contactPerson: existing.contactPerson || '',
+            phone: existing.phone || '',
+            email: existing.email ?? null,
+            address: existing.address ?? null,
+            paymentTerms: existing.paymentTerms ?? null,
+            status: existing.status || 'Active',
+            taxId: existing.kraPin ?? null,
+            accountBalance: Number(existing.currentBalance ?? 0),
+          } as any);
+        } catch (error) {
+          console.error('Error updating supplier in database:', error);
+          const message = error instanceof Error ? error.message : String(error);
+          return res.status(/UNIQUE|constraint/i.test(message) ? 409 : 500).json({
+            message: /UNIQUE|constraint/i.test(message)
+              ? 'A supplier with this name or KRA PIN already exists.'
+              : 'Supplier account could not be updated in the database.',
+          });
+        }
+
+        addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'SUPPLIER_UPDATED', 'Suppliers', `Updated supplier profile for ${existing.name}.`);
+        return res.json(existing);
+      }
+    }
+
+    const newSupplier: SupplierAccount = {
+      id: 'sup-' + Date.now(),
+      name: String(name).trim(),
+      contactPerson,
+      phone: phone || '',
+      email,
+      address,
+      kraPin: normalizedPin || undefined,
+      currentBalance: 0,
+      paymentTerms: paymentTerms || 'Net 14 Days',
+      status: status || 'Active',
+      createdAt: new Date().toISOString(),
+    } as SupplierAccount;
+
+    try {
+      db.supplierQueries.create({
+        id: newSupplier.id,
+        supplierName: newSupplier.name,
+        contactPerson: newSupplier.contactPerson || '',
+        email: newSupplier.email ?? null,
+        phone: newSupplier.phone || '',
+        address: newSupplier.address ?? null,
+        paymentTerms: newSupplier.paymentTerms ?? null,
+        accountBalance: Number(newSupplier.currentBalance ?? 0),
+        status: newSupplier.status || 'Active',
+        taxId: newSupplier.kraPin ?? null,
+        bankName: null,
+        bankAccount: null,
+      } as any);
+    } catch (error) {
+      console.error('Error saving supplier to database:', error);
+      const message = error instanceof Error ? error.message : String(error);
+      return res.status(/UNIQUE|constraint/i.test(message) ? 409 : 500).json({
+        message: /UNIQUE|constraint/i.test(message)
+          ? 'A supplier with this name or KRA PIN already exists.'
+          : 'Supplier could not be saved to the database.',
+      });
+    }
+
+    suppliers.unshift(newSupplier);
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'SUPPLIER_CREATED', 'Suppliers', `Registered new oil supplier ${newSupplier.name}.`);
+    res.json(newSupplier);
+  });
+
+  app.delete('/api/suppliers/:id', (req: any, res) => {
+    const permCheck = requirePermission(req, res, 'DELETE_SUPPLIER', 'delete supplier');
+    if (permCheck) return permCheck;
+    const supplier = suppliers.find((item) => item.id === req.params.id);
+    if (!supplier) return res.status(404).json({ message: 'Supplier not found.' });
+    const hasHistory = deliveries.some((delivery) => delivery.supplierId === supplier.id || normalizeSupplierName(delivery.supplierName) === normalizeSupplierName(supplier.name))
+      || supplierPayments.some((payment) => payment.supplierId === supplier.id)
+      || Number(supplier.currentBalance || 0) !== 0;
+    if (hasHistory) return res.status(409).json({ message: 'Supplier cannot be deleted because it has deliveries, payments, or an outstanding balance.' });
+    db.supplierQueries.delete(supplier.id);
+    suppliers = suppliers.filter((item) => item.id !== supplier.id);
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'SUPPLIER_DELETED', 'Suppliers', `Deleted supplier ${supplier.name} (${supplier.id}).`, 'Warning');
+    res.json({ success: true });
+  });
+
+  app.post('/api/suppliers/payment', (req, res) => {
+    const { supplierId, amount, paymentMethod, referenceNo, deliveryNoteNo, notes } = req.body;
+    const permCheck = requirePermission(req, res, 'RECORD_SUPPLIER_PAYOUT', 'Supplier payment');
+    if (permCheck) return permCheck;
+
+    const actor = (req as any).authUser as User;
+    const sup = resolveRegisteredSupplier(supplierId);
+    if (!sup) {
+      return res.status(400).json({
+        message: 'Supplier must be registered before any payment or delivery-related transaction can be recorded.',
+      });
+    }
+
+    const payAmount = Number(amount);
+    if (isNaN(payAmount) || payAmount <= 0) {
+      return res.status(400).json({ message: 'Payment amount must be greater than zero.' });
+    }
+
+    if (payAmount > sup.currentBalance) {
+      return res.status(400).json({
+        message: `Payment amount cannot exceed the supplier's outstanding balance of KES ${sup.currentBalance.toLocaleString('en-KE', { minimumFractionDigits: 2 })}.`,
+      });
+    }
+
+    const suppliedReference = String(referenceNo || '').trim();
+    if (suppliedReference && supplierPayments.some((payment) => payment.referenceNo === suppliedReference)) {
+      return res.status(409).json({ message: 'A supplier payout with this reference has already been recorded.' });
+    }
+
+    const oldBalance = sup.currentBalance;
+    sup.currentBalance = Number((sup.currentBalance - payAmount).toFixed(2));
+
+    try {
+      db.supplierQueries.update(sup.id, {
+        supplierName: sup.name,
+        contactPerson: sup.contactPerson || '',
+        phone: sup.phone || '',
+        email: sup.email ?? null,
+        address: sup.address ?? null,
+        paymentTerms: sup.paymentTerms ?? null,
+        accountBalance: Number(sup.currentBalance ?? 0),
+        status: sup.status || 'Active',
+        taxId: sup.kraPin ?? null,
+      } as any);
+    } catch (error) {
+      console.error('Error syncing supplier payment balance to database:', error);
+    }
+
+    const paymentRecord: SupplierPayment = {
+      id: 'suppay-' + Date.now(),
+      supplierId: sup.id,
+      supplierName: getSupplierName(sup),
+      timestamp: new Date().toISOString(),
+      amount: payAmount,
+      paymentMethod: paymentMethod || 'Bank Transfer',
+      referenceNo: referenceNo || `PAY-${Math.floor(100000 + Math.random() * 900000)}`,
+      deliveryNoteNo,
+      notes,
+      recordedBy: actor.name,
+    };
+    supplierPayments.unshift(paymentRecord);
+    try {
+      db.supplierPaymentQueries.create({
+        id: paymentRecord.id,
+        supplierId: sup.id,
+        amount: payAmount,
+        paymentMethod: paymentRecord.paymentMethod,
+        referenceNumber: paymentRecord.referenceNo || null,
+        date: new Date().toISOString().slice(0, 10),
+        approvedBy: actor.id,
+        approvedByName: actor.name,
+        notes: paymentRecord.notes || null,
+        status: 'Completed',
+      } as any);
+    } catch (error) {
+      console.error('Error persisting supplier payment to database:', error);
+    }
+
+    sup.currentBalance = getSupplierOutstandingBalance(sup.id);
+    try {
+      db.supplierQueries.update(sup.id, {
+        accountBalance: sup.currentBalance,
+      } as any);
+    } catch (error) {
+      console.error('Error updating supplier balance after payment:', error);
+    }
+
+    // Auto record cash flow outflow
+    const cfRecord: CashFlowRecord = {
+      id: 'cf-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      type: 'Outflow',
+      category: 'Supplier Payment',
+      amount: payAmount,
+      paymentMethod: paymentMethod || 'Bank Transfer',
+      referenceNo: paymentRecord.referenceNo,
+      description: `Payment to Supplier ${getSupplierName(sup)}${deliveryNoteNo ? ` (Delivery Note: ${deliveryNoteNo})` : ''}`,
+      recordedBy: actor.name,
+    };
+    cashFlow.unshift(cfRecord);
+    try {
+      db.cashFlowQueries.create({
+        id: cfRecord.id,
+        date: new Date(cfRecord.timestamp).toISOString().slice(0, 10),
+        type: 'Outflow',
+        category: 'Supplier Payment',
+        description: cfRecord.description,
+        amount: cfRecord.amount,
+        accountingMethod: cfRecord.paymentMethod,
+        referenceNo: cfRecord.referenceNo,
+        relatedTransactionId: null,
+        relatedDeliveryId: null,
+        relatedPaymentId: paymentRecord.id,
+        recordedBy: actor.id,
+        recordedByName: actor.name,
+        approvedBy: null,
+        approvedByName: null,
+        notes: notes || null,
+        status: 'Recorded',
+      } as any);
+    } catch (error) {
+      console.error('Error persisting supplier payout cash flow:', error);
+      return res.status(500).json({ message: 'Supplier payment could not be recorded in cash flow.' });
+    }
+
+    addAuditLog(
+      actor.id,
+      actor.name,
+      actor.role,
+      'SUPPLIER_PAYMENT_RECORDED',
+      'Suppliers',
+      `Recorded KES ${payAmount.toLocaleString()} payment to ${getSupplierName(sup)}. Outstanding balance reduced from KES ${oldBalance.toLocaleString()} to KES ${sup.currentBalance.toLocaleString()}.`
+    );
+
+    res.json({ supplier: sup, payment: paymentRecord, cashFlow: cfRecord });
+  });
+
+  // Stock Management & Inventory Audits
+  const createStockAdjustmentRecord = ({
+    type,
+    itemId,
+    itemName,
+    itemCode,
+    previousQty,
+    newQty,
+    reason,
+    userId,
+    userName,
+    userRole,
+    source = 'Manual Adjustment',
+    referenceNumber,
+    originalDocumentNumber,
+    movementType,
+    notes,
+  }: {
+    type: 'Fuel' | 'Shop';
+    itemId: string;
+    itemName: string;
+    itemCode?: string;
+    previousQty: number;
+    newQty: number;
+    reason: string;
+    userId?: string;
+    userName?: string;
+    userRole?: string;
+    source?: string;
+    referenceNumber?: string;
+    originalDocumentNumber?: string;
+    movementType?: string;
+    notes?: string;
+  }) => {
+    const effectiveDifference = Number(newQty) - Number(previousQty);
+    const effectiveMovementType = effectiveDifference > 0 ? 'Stock Increase' : effectiveDifference < 0 ? 'Stock Decrease' : 'No Change';
+    const normalizedReason = reason || 'Stock Take Audit';
+    const entry: StockAdjustment = {
+      id: 'adj-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+      timestamp: new Date().toISOString(),
+      type,
+      itemId,
+      itemName,
+      itemCode,
+      previousQty: Number(previousQty),
+      adjustedQty: Number(newQty),
+      differenceQty: effectiveDifference,
+      reason: normalizedReason as any,
+      movementType: effectiveMovementType,
+      source,
+      referenceNumber,
+      originalDocumentNumber,
+      performedBy: userName || 'System',
+      notes: notes || `Inventory ${type === 'Fuel' ? 'fuel tank' : 'shop item'} adjusted. Previous=${previousQty}; New=${newQty}; Difference=${effectiveDifference}`,
+      recordedBy: userName || 'Station Manager',
+    };
+
+    db.stockAdjustmentQueries.create({
+      id: entry.id,
+      type,
+      referenceId: itemId,
+      referenceName: itemName,
+      previousQuantity: Number(previousQty),
+      adjustmentQuantity: effectiveDifference,
+      newQuantity: Number(newQty),
+      reason: normalizedReason,
+      movementType: effectiveMovementType,
+      source,
+      referenceNumber: referenceNumber || null,
+      originalDocumentNumber: originalDocumentNumber || null,
+      productCode: itemCode || null,
+      performedBy: userName || userId || 'System',
+      recordedBy: userId || 'sys',
+      recordedByName: userName || 'Station Manager',
+      notes: entry.notes || null,
+    } as any);
+
+    addAuditLog(
+      userId || 'sys',
+      userName || 'Manager',
+      userRole || 'Admin',
+      'STOCK_ADJUSTMENT_LOGGED',
+      'Stock',
+      `Stock adjustment for ${itemName}: Previous=${previousQty}, New=${newQty}, Diff=${effectiveDifference}. Reason: ${normalizedReason}. Source: ${source}${referenceNumber ? ` Ref: ${referenceNumber}` : ''}`
+    );
+
+    stockAdjustments.unshift(entry);
+    return entry;
+  };
+
+  app.get('/api/stock/adjustments', (req, res) => {
+    const roleCheck = requirePermission(req as any, res, 'ADJUST_STOCK', 'view stock adjustment logs');
+    if (roleCheck) return roleCheck;
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 15)));
+    const sqlite = getSqlite();
+    const total = Number((sqlite.prepare('SELECT COUNT(*) AS count FROM stock_adjustments').get() as any).count || 0);
+    const records = sqlite.prepare('SELECT * FROM stock_adjustments ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
+      .all(pageSize, (page - 1) * pageSize)
+      .map((record: any) => ({
+        id: record.id,
+        timestamp: record.created_at,
+        type: record.type,
+        itemId: record.reference_id,
+        itemName: record.reference_name,
+        itemCode: record.product_code || undefined,
+        previousQty: Number(record.previous_quantity),
+        adjustedQty: Number(record.new_quantity),
+        differenceQty: Number(record.adjustment_quantity),
+        reason: record.reason,
+        movementType: record.movement_type || undefined,
+        source: record.source || undefined,
+        referenceNumber: record.reference_number || undefined,
+        originalDocumentNumber: record.original_document_number || undefined,
+        performedBy: record.performed_by || undefined,
+        notes: record.notes || undefined,
+        recordedBy: record.recorded_by_name || 'System',
+      }));
+    res.json({ records, page, pageSize, total, totalPages: Math.ceil(total / pageSize) });
+  });
+
+  app.post('/api/stock/adjustments', (req, res) => {
+    const { type, itemId, newQty, reason } = req.body;
+    const roleCheck = requirePermission(req as any, res, 'ADJUST_STOCK', 'stock adjustments');
+    if (roleCheck) return roleCheck;
+    const actor = (req as any).authUser as User;
+
+    let previousQty = 0;
+    let itemName = '';
+
+    if (type === 'Fuel') {
+      const tank = tanks.find((t) => t.id === itemId);
+      if (!tank) return res.status(404).json({ message: 'Fuel tank not found.' });
+      previousQty = tank.currentLevelLiters;
+      tank.currentLevelLiters = Number(newQty);
+      tank.lastDipReading = Number(newQty);
+      tank.lastDipTime = new Date().toISOString();
+      itemName = tank.tankName;
+    } else {
+      const item = shopItems.find((s) => s.id === itemId);
+      if (!item) return res.status(404).json({ message: 'Shop item not found.' });
+      previousQty = item.stockQty;
+      item.stockQty = Number(newQty);
+      itemName = item.name;
+    }
+
+    let adjRecord: StockAdjustment;
+    try {
+      adjRecord = createStockAdjustmentRecord({
+        type: (type || 'Shop') as 'Fuel' | 'Shop',
+        itemId,
+        itemName,
+        previousQty,
+        newQty: Number(newQty),
+        reason: reason || 'Stock Take Audit',
+        userId: actor.id,
+        userName: actor.name,
+        userRole: actor.role,
+        source: 'Manual Adjustment',
+        movementType: Number(newQty) - previousQty > 0 ? 'Stock Increase' : Number(newQty) - previousQty < 0 ? 'Stock Decrease' : 'No Change',
+        notes: `Inventory ${type === 'Fuel' ? 'fuel tank' : 'shop item'} adjusted. Previous=${previousQty}; New=${newQty}; Difference=${Number(newQty) - previousQty}`,
+      });
+    } catch (error) {
+      if (type === 'Fuel') {
+        const tank = tanks.find((entry) => entry.id === itemId);
+        if (tank) tank.currentLevelLiters = previousQty;
+      } else {
+        const item = shopItems.find((entry) => entry.id === itemId);
+        if (item) item.stockQty = previousQty;
+      }
+      console.error('Error persisting stock adjustment:', error);
+      return res.status(500).json({ message: 'Stock adjustment could not be recorded.' });
+    }
+
+    if (type === 'Fuel') {
+      const tank = tanks.find((t) => t.id === itemId);
+      if (tank) {
+        try {
+          db.tankQueries.update(tank.id, {
+            currentLevelLiters: Number(newQty),
+            lastDipReading: Number(newQty),
+            lastDipTime: new Date().toISOString(),
+          } as any);
+        } catch (error) {
+          console.error('Error persisting fuel stock adjustment:', error);
+        }
+      }
+    } else {
+      const item = shopItems.find((s) => s.id === itemId);
+      if (item) {
+        try {
+          db.shopItemQueries.update(item.id, {
+            stockQty: Number(newQty),
+          } as any);
+        } catch (error) {
+          console.error('Error persisting shop stock adjustment:', error);
+        }
+      }
+    }
+
+    res.json(adjRecord);
+  });
+
+  // Corporate Customer Accounts & Credit Debt Management
+  app.get('/api/customers', (req, res) => {
+    res.json(customers.map(normalizeCustomerRecord));
+  });
+
+  app.post('/api/customers', (req, res) => {
+    const { id, name, kraPin, phone, email, address, creditLimit, vehicles, status, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_CREDIT_CUSTOMERS', 'Customer account management');
+    if (permCheck) return permCheck;
+    const normalizedCustomerName = normalizeSupplierName(name);
+    const normalizedPin = normalizeTaxId(kraPin);
+    if (!normalizedCustomerName) return res.status(400).json({ message: 'Customer name is required.' });
+    if (!normalizedPin) return res.status(400).json({ message: 'Customer KRA PIN is required.' });
+    if (customers.some((customer) => customer.id !== id && normalizeSupplierName(customer.name) === normalizedCustomerName)) {
+      return res.status(409).json({ message: 'A customer account with this name already exists.' });
+    }
+    if (customers.some((customer) => customer.id !== id && normalizeTaxId(customer.kraPin) === normalizedPin)) {
+      return res.status(409).json({ message: 'A customer with this KRA PIN already exists.' });
+    }
+
+    if (id) {
+      const existing = customers.find((c) => c.id === id);
+      if (existing) {
+        const updatedCustomer: CustomerAccount = {
+          ...existing,
+          name: String(name || existing.name).trim(),
+          kraPin: normalizedPin,
+          phone: phone || existing.phone,
+          email: email !== undefined ? email : existing.email,
+          address: address !== undefined ? address : existing.address,
+          creditLimit: creditLimit !== undefined ? Number(creditLimit) : existing.creditLimit,
+          status: status || existing.status,
+          vehicles: Array.isArray(vehicles) ? vehicles : existing.vehicles,
+        };
+
+        try {
+          db.customerQueries.update(existing.id, {
+            businessName: updatedCustomer.name,
+            contactPerson: updatedCustomer.name,
+            email: updatedCustomer.email ?? null,
+            phone: updatedCustomer.phone || '',
+            address: updatedCustomer.address ?? null,
+            accountType: 'Corporate',
+            creditLimit: Number(updatedCustomer.creditLimit ?? 0),
+            currentDebt: Number(updatedCustomer.currentBalance ?? 0),
+            status: updatedCustomer.status || 'Active',
+            taxId: updatedCustomer.kraPin ?? null,
+          } as any);
+        } catch (error) {
+          console.error('Error updating customer in database:', error);
+          const message = error instanceof Error ? error.message : String(error);
+          return res.status(/UNIQUE|constraint/i.test(message) ? 409 : 500).json({
+            message: /UNIQUE|constraint/i.test(message)
+              ? 'A customer with this KRA PIN already exists.'
+              : 'Customer account could not be updated in the database.',
+          });
+        }
+
+        Object.assign(existing, updatedCustomer);
+
+        addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'CUSTOMER_UPDATED', 'Sales', `Updated customer ${existing.name} (Credit Limit: KES ${existing.creditLimit.toLocaleString()}, Status: ${existing.status}).`);
+        return res.json(existing);
+      }
+    }
+
+    const newCust: CustomerAccount = {
+      id: 'cust-' + Date.now(),
+      name: String(name).trim(),
+      kraPin: normalizedPin,
+      phone: phone || '',
+      email,
+      address,
+      creditLimit: Number(creditLimit || 100000),
+      currentBalance: 0,
+      vehicles: Array.isArray(vehicles) ? vehicles : [],
+      status: status || 'Active',
+      createdAt: new Date().toISOString(),
+    };
+
+    try {
+      db.customerQueries.create({
+        id: newCust.id,
+        businessName: newCust.name,
+        contactPerson: newCust.name,
+        email: newCust.email ?? null,
+        phone: newCust.phone || '',
+        address: newCust.address ?? null,
+        accountType: 'Corporate',
+        creditLimit: Number(newCust.creditLimit ?? 0),
+        currentDebt: Number(newCust.currentBalance ?? 0),
+        status: newCust.status || 'Active',
+        taxId: newCust.kraPin ?? null,
+      } as any);
+    } catch (error) {
+      console.error('Error saving customer to database:', error);
+      const message = error instanceof Error ? error.message : String(error);
+      return res.status(/UNIQUE|constraint/i.test(message) ? 409 : 500).json({
+        message: /UNIQUE|constraint/i.test(message)
+          ? 'A customer with this KRA PIN already exists.'
+          : 'Customer account could not be saved to the database.',
+      });
+    }
+
+    customers.unshift(newCust);
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'CUSTOMER_CREATED', 'Sales', `Created new customer account ${newCust.name} with credit limit KES ${newCust.creditLimit.toLocaleString()}.`);
+    res.json(newCust);
+  });
+
+  app.delete('/api/customers/:id', (req: any, res) => {
+    const permCheck = requirePermission(req, res, 'DELETE_CUSTOMER', 'delete customer');
+    if (permCheck) return permCheck;
+    const customer = customers.find((item) => item.id === req.params.id);
+    if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+    const hasHistory = transactions.some((transaction: any) => transaction.customerId === customer.id || normalizeTaxId(transaction.customerPin) === normalizeTaxId(customer.kraPin))
+      || creditNotes.some((note: any) => note.customerId === customer.id || normalizeTaxId(note.customerPin) === normalizeTaxId(customer.kraPin))
+      || Number(customer.currentBalance || 0) !== 0;
+    if (hasHistory) return res.status(409).json({ message: 'Customer cannot be deleted because financial history or an outstanding balance exists.' });
+    db.customerQueries.delete(customer.id);
+    customers = customers.filter((item) => item.id !== customer.id);
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'CUSTOMER_DELETED', 'Sales', `Deleted customer ${customer.name} (${customer.id}).`, 'Warning');
+    res.json({ success: true });
+  });
+
+  app.post('/api/customers/repayment', (req, res) => {
+    const { customerId, amount, paymentMethod, referenceNo, notes, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_CASH_FLOW', 'Customer repayment');
+    if (permCheck) return permCheck;
+
+    const cust = customers.find((c) => c.id === customerId);
+    if (!cust) return res.status(404).json({ message: 'Customer account not found.' });
+
+    const payAmount = Number(amount);
+    if (payAmount <= 0) {
+      return res.status(400).json({ message: 'Repayment amount must be greater than zero.' });
+    }
+
+    const oldBalance = cust.currentBalance;
+    cust.currentBalance = Math.max(0, cust.currentBalance - payAmount);
+
+    try {
+      db.customerQueries.update(cust.id, {
+        businessName: cust.name,
+        contactPerson: cust.name,
+        email: cust.email ?? null,
+        phone: cust.phone || '',
+        address: cust.address ?? null,
+        accountType: 'Corporate',
+        creditLimit: Number(cust.creditLimit ?? 0),
+        currentDebt: Number(cust.currentBalance ?? 0),
+        status: cust.status || 'Active',
+        taxId: cust.kraPin ?? null,
+      } as any);
+    } catch (error) {
+      console.error('Error updating customer debt balance in database:', error);
+    }
+
+    const cfRecord: CashFlowRecord = {
+      id: 'cf-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      type: 'Inflow',
+      category: 'Debt Repayment',
+      amount: payAmount,
+      paymentMethod: paymentMethod || 'Bank Transfer',
+      referenceNo: referenceNo || `PAY-${Math.floor(100000 + Math.random() * 900000)}`,
+      description: `Debt repayment by ${cust.name} (${notes || 'Credit account settlement'})`,
+      recordedBy: userName || 'Station Staff',
+    };
+
+    try {
+      db.cashFlowQueries.create({
+        id: cfRecord.id,
+        date: cfRecord.timestamp.slice(0, 10),
+        type: 'Inflow',
+        category: cfRecord.category,
+        description: cfRecord.description,
+        amount: cfRecord.amount,
+        accountingMethod: cfRecord.paymentMethod,
+        referenceNo: cfRecord.referenceNo,
+        relatedTransactionId: null,
+        relatedDeliveryId: null,
+        relatedPaymentId: null,
+        recordedBy: userId || null,
+        recordedByName: cfRecord.recordedBy,
+        approvedBy: null,
+        approvedByName: null,
+        notes: cfRecord.referenceNo || null,
+        status: 'Recorded',
+      } as any);
+    } catch (error) {
+      cust.currentBalance = oldBalance;
+      console.error('Error saving customer repayment cash flow to database:', error);
+      return res.status(500).json({ message: 'Debt repayment could not be saved.' });
+    }
+
+    cashFlow.unshift(cfRecord);
+
+    addAuditLog(
+      userId || 'sys',
+      userName || 'Staff',
+      userRole || 'Station Manager',
+      'CUSTOMER_DEBT_REPAYMENT',
+      'Sales',
+      `Received KES ${payAmount.toLocaleString()} debt repayment from ${cust.name}. Debt balance reduced from KES ${oldBalance.toLocaleString()} to KES ${cust.currentBalance.toLocaleString()}.`
+    );
+
+    res.json({ customer: cust, cashFlow: cfRecord });
+  });
+
+  // Cash Flow Ledger
+  app.get('/api/cash-flow', (req, res) => {
+    res.json(cashFlow);
+  });
+
+  app.post('/api/cash-flow', (req, res) => {
+    const { type, category, amount, paymentMethod, referenceNo, description, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'MANAGE_CASH_FLOW', 'Cash flow entry');
+    if (permCheck) return permCheck;
+
+    if (!amount || Number(amount) <= 0) {
+      return res.status(400).json({ message: 'Amount must be greater than zero.' });
+    }
+
+    const newRecord: CashFlowRecord = {
+      id: 'cf-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      type: type || 'Inflow',
+      category: category || 'Other',
+      amount: Number(amount),
+      paymentMethod: paymentMethod || 'Cash',
+      referenceNo: referenceNo || `REF-${Math.floor(100000 + Math.random() * 900000)}`,
+      description: description || 'Manual cash flow entry',
+      recordedBy: userName || 'Station Staff',
+    };
+
+    try {
+      db.cashFlowQueries.create({
+        id: newRecord.id,
+        date: newRecord.timestamp.slice(0, 10),
+        type: newRecord.type === 'Outflow' ? 'Expense' : 'Inflow',
+        category: newRecord.category,
+        description: newRecord.description,
+        amount: newRecord.amount,
+        accountingMethod: newRecord.paymentMethod,
+        referenceNo: newRecord.referenceNo,
+        relatedTransactionId: null,
+        relatedDeliveryId: null,
+        relatedPaymentId: null,
+        recordedBy: userId || null,
+        recordedByName: newRecord.recordedBy,
+        approvedBy: null,
+        approvedByName: null,
+        notes: newRecord.referenceNo,
+        status: 'Recorded',
+      } as any);
+    } catch (error) {
+      console.error('Error saving cash flow entry to database:', error);
+      return res.status(500).json({ message: 'Cash flow entry could not be saved.' });
+    }
+
+    cashFlow.unshift(newRecord);
+    addAuditLog(userId || 'sys', userName || 'Staff', userRole || 'Manager', 'CASH_FLOW_LOGGED', 'Sales', `Recorded ${type} of KES ${Number(amount).toLocaleString()} (${category}): ${description}`);
+    res.json(newRecord);
+  });
+
+  // ---- Credit Notes ----
+  app.get('/api/credit-notes', (req, res) => {
+    res.json(creditNotes);
+  });
+
+  app.post('/api/credit-notes', (req, res) => {
+    const {
+      originalTransactionId,
+      originalDocumentType,
+      originalDocumentNo,
+      originalInvoiceNo,
+      originalReceiptNo,
+      documentType,
+      customerName,
+      customerPin,
+      vehiclePlate,
+      items,
+      reason,
+      issuedBy,
+      userId,
+      userName,
+      userRole,
+    } = req.body;
+
+    const permCheck = requirePermission(req, res, 'CREATE_CREDIT_NOTE', 'Credit note creation');
+    if (permCheck) return permCheck;
+
+    const normalizedInvoiceNo = String(originalInvoiceNo || '').trim();
+    const normalizedReceiptNo = String(originalReceiptNo || '').trim();
+    const requestedDocumentType = String(originalDocumentType || documentType || 'invoice').toLowerCase();
+    const targetType = requestedDocumentType === 'receipt' ? 'receipt' : 'invoice';
+    const normalizedOriginalDocumentNo = String(originalDocumentNo || (targetType === 'receipt' ? normalizedReceiptNo : normalizedInvoiceNo) || '').trim();
+
+    let originalTx = transactions.find((tx) => tx.id === originalTransactionId);
+
+    if (!originalTx) {
+      const exactDocNo = normalizeDocumentNumber(
+        normalizedOriginalDocumentNo || (targetType === 'receipt' ? normalizedReceiptNo : normalizedInvoiceNo),
+        targetType === 'receipt' ? 'Rcpt' : 'Inv'
+      );
+
+      if (targetType === 'receipt') {
+        originalTx = transactions.find((tx) => tx.receiptNo && normalizeDocumentNumber(tx.receiptNo, 'Rcpt') === exactDocNo);
+      } else {
+        originalTx = transactions.find((tx) => tx.taxInvoiceNo && normalizeDocumentNumber(tx.taxInvoiceNo, 'Inv') === exactDocNo);
+      }
+    }
+
+    if (!originalTx && normalizedReceiptNo) {
+      originalTx = transactions.find((tx) => tx.receiptNo && normalizeDocumentNumber(tx.receiptNo, 'Rcpt') === normalizeDocumentNumber(normalizedReceiptNo, 'Rcpt'));
+    }
+
+    if (!originalTx && normalizedInvoiceNo) {
+      originalTx = transactions.find((tx) => tx.taxInvoiceNo && normalizeDocumentNumber(tx.taxInvoiceNo, 'Inv') === normalizeDocumentNumber(normalizedInvoiceNo, 'Inv'));
+    }
+
+    if (!originalTx) {
+      return res.status(400).json({ message: 'The original receipt or invoice could not be found. Select an existing source document.' });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'Select at least one original document item to credit.' });
+    }
+
+    const effectiveInvoiceNo = (normalizedInvoiceNo && /^Inv/i.test(normalizedInvoiceNo)) ? normalizedInvoiceNo : (originalTx?.taxInvoiceNo || normalizedInvoiceNo || '');
+    const effectiveReceiptNo = (normalizedReceiptNo && /^(Rcpt|Rec)/i.test(normalizedReceiptNo)) ? normalizedReceiptNo : (originalTx?.receiptNo || normalizedReceiptNo || '');
+    const actualCreditDocumentNo = targetType === 'receipt' ? (effectiveReceiptNo || effectiveInvoiceNo) : (effectiveInvoiceNo || effectiveReceiptNo);
+
+    const matchesOriginalTransaction = (creditNote: CreditNote) => {
+      if (creditNote.status === 'Voided') return false;
+      if (creditNote.originalTransactionId === originalTx.id) return true;
+      const sameInvoice = !!originalTx.taxInvoiceNo && !!creditNote.originalInvoiceNo &&
+        normalizeDocumentNumber(creditNote.originalInvoiceNo, 'Inv') === normalizeDocumentNumber(originalTx.taxInvoiceNo, 'Inv');
+      const sameReceipt = !!originalTx.receiptNo && !!creditNote.originalReceiptNo &&
+        normalizeDocumentNumber(creditNote.originalReceiptNo, 'Rcpt') === normalizeDocumentNumber(originalTx.receiptNo, 'Rcpt');
+      return sameInvoice || sameReceipt;
+    };
+
+    let resolvedItems: { requestedQty: number; originalItem: Transaction['items'][number] }[];
+    try {
+      resolvedItems = (items as any[]).map((requestedItem) => {
+        const requestedQty = Number(requestedItem.quantity ?? requestedItem.qty ?? 0);
+        const requestedItemId = String(requestedItem.originalItemId || requestedItem.itemId || '').trim();
+        const requestedName = String(requestedItem.name || '').trim();
+        const originalItem = originalTx.items.find((sourceItem) => sourceItem.itemId === requestedItemId) ||
+          originalTx.items.find((sourceItem) => String(sourceItem.name || '').trim().toLowerCase() === requestedName.toLowerCase());
+
+        if (!originalItem) {
+          throw new Error(`Requested credit item '${requestedName || requestedItemId || 'unknown item'}' does not exist on the original document.`);
+        }
+        if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
+          throw new Error(`Credit quantity for ${originalItem.name} must be greater than zero.`);
+        }
+        return { requestedQty, originalItem };
+      });
+    } catch (error) {
+      return res.status(400).json({ message: error instanceof Error ? error.message : 'Invalid credit-note items.' });
+    }
+
+    try {
+      const requestedQuantityByItem = new Map<string, number>();
+      for (const { requestedQty, originalItem } of resolvedItems) {
+        const itemKey = originalItem.itemId || String(originalItem.name || '').trim().toLowerCase();
+        requestedQuantityByItem.set(itemKey, (requestedQuantityByItem.get(itemKey) || 0) + requestedQty);
+      }
+
+      for (const [itemKey, requestedQty] of requestedQuantityByItem) {
+        const originalItem = originalTx.items.find((sourceItem) => (sourceItem.itemId || String(sourceItem.name || '').trim().toLowerCase()) === itemKey)!;
+        const previouslyCreditedQty = creditNotes
+          .filter(matchesOriginalTransaction)
+          .flatMap((creditNote) => creditNote.items || [])
+          .filter((creditedItem) =>
+            (!!originalItem.itemId && creditedItem.originalItemId === originalItem.itemId) ||
+            String(creditedItem.name || '').trim().toLowerCase() === String(originalItem.name || '').trim().toLowerCase()
+          )
+          .reduce((sum, creditedItem) => sum + Number(creditedItem.quantity ?? creditedItem.qty ?? 0), 0);
+        const originalQty = Number(originalItem.qty || 0);
+        const remainingQty = Math.max(0, originalQty - previouslyCreditedQty);
+
+        if (requestedQty > remainingQty + 0.0001) {
+          return res.status(400).json({
+            message: `Credit quantity for ${originalItem.name} exceeds its remaining balance. Original quantity: ${originalQty}, previously credited: ${previouslyCreditedQty}, requested: ${requestedQty}, remaining: ${remainingQty}.`,
+            item: originalItem.name,
+            originalQty,
+            previouslyCreditedQty,
+            requestedQty,
+            remainingQty,
+          });
+        }
+      }
+    } catch (error) {
+      return res.status(400).json({ message: error instanceof Error ? error.message : 'Invalid credit-note items.' });
+    }
+
+    const creditedItems = resolvedItems.map(({ requestedQty, originalItem }) => ({
+      quantity: requestedQty,
+      unitPrice: Number(originalItem.unitPrice || 0),
+      taxCode: normalizeTaxCodeValue(String(originalItem.taxCode || 'A').toUpperCase()),
+    }));
+
+    const computedTotals = computeDocumentTotals(creditedItems);
+    const subtotal = computedTotals.subtotal;
+    const totalTax = computedTotals.taxAmount;
+    const totalAmount = computedTotals.totalAmount;
+
+    const formattedItems = creditedItems.map((line, index) => {
+      const item = (items || [])[index] ?? {};
+      const { requestedQty: qty, originalItem: selectedOriginalItem } = resolvedItems[index];
+      const unitPrice = Number(selectedOriginalItem.unitPrice || 0);
+      const taxCode = normalizeTaxCodeValue(String(selectedOriginalItem.taxCode || 'A').toUpperCase());
+      const lineTotals = computedTotals.items[index] ?? {
+        grossAmount: qty * unitPrice,
+        netAmount: qty * unitPrice,
+        taxAmount: 0,
+        taxRate: TAX_RATE_MAP[taxCode] ?? 0,
+      };
+      return {
+        itemId: item.itemId || `item-cn-${index}`,
+        originalItemId: selectedOriginalItem?.itemId || exactOriginalItemId || item.itemId || `item-cn-${index}`,
+        name: selectedOriginalItem.name,
+        type: selectedOriginalItem.type || 'Fuel',
+        qty,
+        quantity: qty,
+        unitPrice,
+        totalPrice: lineTotals.grossAmount,
+        totalAmount: lineTotals.grossAmount,
+        taxableAmount: lineTotals.netAmount,
+        taxAmount: lineTotals.taxAmount,
+        taxRate: lineTotals.taxRate,
+        taxCode,
+      };
+    });
+
+    {
+      const originalTotalAmount = Number(originalTx.totalAmount ?? 0);
+      const alreadyCredited = creditNotes.reduce((sum, cn) => {
+        return matchesOriginalTransaction(cn) ? sum + Number(cn.totalAmount ?? 0) : sum;
+      }, 0);
+      const remainingCredit = Math.max(originalTotalAmount - alreadyCredited, 0);
+      if (totalAmount > remainingCredit + 0.0001) {
+        return res.status(400).json({
+          message: `Credit note exceeds remaining creditable amount on ${originalTx.taxInvoiceNo || originalTx.receiptNo || 'this document'}. Remaining: KES ${remainingCredit.toFixed(2)}.`,
+          remaining: remainingCredit,
+          originalTotal: originalTotalAmount,
+          alreadyCredited,
+        });
+      }
+
+    }
+
+    const newCN: CreditNote = {
+      id: 'cn-' + Date.now(),
+      creditNoteNo: generateCreditNoteNumber(),
+      originalTransactionId: originalTx?.id,
+      originalDocumentType: targetType,
+      originalDocumentNo: actualCreditDocumentNo || normalizedOriginalDocumentNo || (targetType === 'receipt' ? effectiveReceiptNo : effectiveInvoiceNo),
+      originalInvoiceNo: targetType === 'invoice' ? (effectiveInvoiceNo || actualCreditDocumentNo || 'Inv000') : (originalTx?.taxInvoiceNo || normalizedInvoiceNo || ''),
+      originalReceiptNo: targetType === 'receipt' ? (effectiveReceiptNo || actualCreditDocumentNo || 'Rcpt000') : (originalTx?.receiptNo || normalizedReceiptNo || ''),
+      timestamp: new Date().toISOString(),
+      customerName: customerName || 'Walk-in Customer',
+      customerPin,
+      vehiclePlate,
+      items: formattedItems,
+      subtotal,
+      taxAmount: totalTax,
+      totalAmount,
+      reason,
+      issuedBy: issuedBy || userName || 'Station Manager',
+      status: 'Issued',
+    };
+
+    try {
+      db.creditNoteQueries.create({
+        id: newCN.id,
+        creditNoteNo: newCN.creditNoteNo,
+        customerId: null,
+        customerName: newCN.customerName || 'Walk-in Customer',
+        customerPin: newCN.customerPin || null,
+        vehiclePlate: newCN.vehiclePlate || null,
+        amount: Number(newCN.totalAmount ?? totalAmount),
+        subtotal: Number(newCN.subtotal ?? subtotal),
+        taxAmount: Number(newCN.taxAmount ?? totalTax),
+        totalAmount: Number(newCN.totalAmount ?? totalAmount),
+        reason: newCN.reason || reason || 'Other Reason',
+        narration: newCN.reason || reason || 'Credit note issued',
+        status: newCN.status || 'Issued',
+        itemsJson: JSON.stringify(newCN.items || []),
+        originalTransactionId: newCN.originalTransactionId || originalTx?.id || null,
+        originalDocumentType: newCN.originalDocumentType || targetType || 'invoice',
+        originalDocumentNo: newCN.originalDocumentNo || actualCreditDocumentNo || normalizedOriginalDocumentNo || null,
+        originalInvoiceNo: newCN.originalInvoiceNo || (targetType === 'invoice' ? effectiveInvoiceNo || actualCreditDocumentNo || null : null),
+        originalReceiptNo: newCN.originalReceiptNo || (targetType === 'receipt' ? effectiveReceiptNo || actualCreditDocumentNo || null : null),
+        issuedBy: userId || null,
+        issuedByName: issuedBy || userName || 'Station Manager',
+        approvedBy: null,
+        approvedByName: null,
+        appliedToTransactionId: null,
+        timestamp: newCN.timestamp,
+      } as any);
+    } catch (error) {
+      console.error('Error saving credit note to database:', error);
+      return res.status(500).json({ error: 'Credit note could not be saved.' });
+    }
+
+    // ---- Add cash flow record (OUTFLOW) ----
+    try {
+      const cashFlowRecord: CashFlowRecord = {
+        id: 'cf-' + Date.now(),
+        timestamp: newCN.timestamp,
+        type: 'Outflow',
+        category: 'Credit Note',
+        amount: newCN.totalAmount,
+        paymentMethod: 'Credit',
+        referenceNo: newCN.creditNoteNo,
+        description: `Credit note ${newCN.creditNoteNo} issued against ${newCN.originalDocumentNo || 'unknown document'} - ${reason || 'No reason provided'}`,
+        recordedBy: issuedBy || userName || 'Station Manager',
+      };
+
+      db.cashFlowQueries.create({
+        id: cashFlowRecord.id,
+        date: cashFlowRecord.timestamp.slice(0, 10),
+        type: 'Expense',
+        category: cashFlowRecord.category,
+        description: cashFlowRecord.description,
+        amount: cashFlowRecord.amount,
+        accountingMethod: cashFlowRecord.paymentMethod,
+        referenceNo: cashFlowRecord.referenceNo,
+        relatedTransactionId: originalTx?.id || null,
+        relatedDeliveryId: null,
+        relatedPaymentId: null,
+        recordedBy: userId || null,
+        recordedByName: cashFlowRecord.recordedBy,
+        approvedBy: null,
+        approvedByName: null,
+        notes: `Credit note ${newCN.creditNoteNo}`,
+        status: 'Recorded',
+      });
+
+      cashFlow.unshift(cashFlowRecord);
+    } catch (error) {
+      console.error('Error saving credit note cash flow entry:', error);
+      return res.status(500).json({ error: 'Credit note saved but cash flow entry failed.' });
+    }
+
+    const stockRestorationEntries = (newCN.items || []).filter((item: any) => {
+      const itemType = String(item.type || '').toLowerCase();
+      return itemType === 'shop';
+    });
+
+    for (const item of stockRestorationEntries) {
+      const itemQty = Number(item.qty ?? item.quantity ?? 0);
+      if (!(itemQty > 0)) continue;
+
+      let targetItem: any = null;
+      const originalMatchKey = String(item.originalItemId || item.itemId || '').trim();
+      if (originalTx && originalMatchKey) {
+        const originalSource = originalTx.items.find((src) => src.itemId === originalMatchKey);
+        if (originalSource) {
+          targetItem = shopItems.find((shopItem) => shopItem.id === originalSource.itemId || shopItem.name.toLowerCase() === originalSource.name.toLowerCase());
+        }
+      }
+
+      if (!targetItem) {
+        targetItem = shopItems.find((shopItem) => {
+          const sameName = String(shopItem.name || '').trim().toLowerCase() === String(item.name || '').trim().toLowerCase();
+          const sameCode = !!item.itemId && shopItem.code && String(shopItem.code).trim().toLowerCase() === String(item.itemId).trim().toLowerCase();
+          return sameName || sameCode;
+        });
+      }
+
+      if (!targetItem) continue;
+
+      const previousQty = Number(targetItem.stockQty ?? 0);
+      const nextQty = previousQty + itemQty;
+
+      const duplicateEntry = stockAdjustments.some((entry) =>
+        entry.source === 'Credit Note' &&
+        entry.referenceNumber === newCN.creditNoteNo &&
+        entry.itemId === targetItem.id &&
+        entry.originalDocumentNumber === (newCN.originalDocumentNo || newCN.originalInvoiceNo || newCN.originalReceiptNo || '—')
+      );
+
+      if (duplicateEntry) continue;
+
+      targetItem.stockQty = nextQty;
+
+      try {
+        db.shopItemQueries.update(targetItem.id, {
+          stockQty: Number(nextQty),
+        } as any);
+      } catch (error) {
+        console.error('Error restoring stock for credited shop item:', error);
+      }
+
+      createStockAdjustmentRecord({
+        type: 'Shop',
+        itemId: targetItem.id,
+        itemName: targetItem.name,
+        itemCode: targetItem.code,
+        previousQty,
+        newQty: nextQty,
+        reason: 'Credit Note Return',
+        userId: userId || 'sys',
+        userName: userName || issuedBy || 'System',
+        userRole: userRole || 'Admin',
+        source: 'Credit Note',
+        referenceNumber: newCN.creditNoteNo,
+        originalDocumentNumber: newCN.originalDocumentNo || newCN.originalInvoiceNo || newCN.originalReceiptNo || '—',
+        movementType: 'Stock Return',
+        notes: `Credit note return restored ${itemQty} ${targetItem.name} unit(s) to inventory. Original document: ${newCN.originalDocumentNo || newCN.originalInvoiceNo || newCN.originalReceiptNo || 'Unknown document'}.`,
+      });
+
+      addAuditLog(
+        userId || 'sys',
+        userName || 'Station Staff',
+        userRole || 'Admin',
+        'CREDIT_NOTE_STOCK_RESTORED',
+        'Shop',
+        `Restored ${itemQty} ${targetItem.name} unit(s) to inventory after credit note ${newCN.creditNoteNo}.`
+      );
+    }
+
+    addAuditLog(
+      userId || 'sys',
+      issuedBy || 'Manager',
+      userRole || 'Admin',
+      'CREDIT_NOTE_ISSUED',
+      'Sales',
+      `Issued Credit Note ${newCN.creditNoteNo} against ${newCN.originalDocumentNo || actualCreditDocumentNo || 'Unknown Document'} for KES ${totalAmount.toFixed(2)}. Reason: ${reason}`,
+      'Warning'
+    );
+
+    creditNotes.unshift(newCN);
+    res.json(newCN);
+  });
+
+  // ======================================================================
+  // SHOP ITEMS – with granular permissions
+  // ======================================================================
+
+  app.get('/api/shop', (req, res) => {
+    res.json(shopItems);
+  });
+
+  app.post('/api/shop', (req, res) => {
+    const {
+      code,
+      name,
+      category,
+      unitPrice,
+      price,
+      costPrice,
+      stockQty,
+      reorderLevel,
+      requireShiftCount,
+      taxCode,
+      taxType,
+      country,
+      currency,
+      productType,
+      unit,
+      userId,
+      userName,
+      userRole,
+    } = req.body;
+    const permCheck = requirePermission(req, res, 'CREATE_SHOP_ITEM', 'Shop item creation');
+    if (permCheck) return permCheck;
+
+    const normalizedTaxCode = String(taxType || taxCode || 'A').toUpperCase();
+    const allowedTaxCodes = ['A', 'B', 'C', 'D', 'E'];
+    if (!allowedTaxCodes.includes(normalizedTaxCode)) {
+      return res.status(400).json({ message: 'Tax code is required and must be one of A, B, C, D, or E.' });
+    }
+
+    const normalizedCountry = String(country || 'KE').toUpperCase();
+    const normalizedCurrency = String(currency || 'KES').toUpperCase();
+    const normalizedUnit = String(unit || 'Pieces');
+    const normalizedProductType = Number(productType ?? 1);
+    const normalizedPrice = Number(price ?? unitPrice ?? 0);
+
+    const newItem: ShopItem = {
+      id: 'shp-' + Date.now(),
+      code: code || `ITM-${Math.floor(100 + Math.random() * 900)}`,
+      name,
+      category: category || 'General',
+      unitPrice: Number(unitPrice ?? normalizedPrice),
+      price: Number(normalizedPrice),
+      costPrice: Number(costPrice || normalizedPrice * 0.8),
+      stockQty: Number(stockQty || 0),
+      reorderLevel: Number(reorderLevel || 5),
+      requireShiftCount: Boolean(requireShiftCount),
+      taxCode: normalizedTaxCode as any,
+      taxType: normalizedTaxCode as any,
+      country: normalizedCountry as any,
+      currency: normalizedCurrency as any,
+      productType: [1, 2, 3].includes(normalizedProductType) ? (normalizedProductType as 1 | 2 | 3) : 1,
+      unit: (normalizedUnit as any),
+    } as ShopItem;
+
+    shopItems.unshift(newItem);
+
+    try {
+      db.shopItemQueries.create({
+        id: newItem.id,
+        code: newItem.code,
+        name: newItem.name,
+        category: newItem.category,
+        unitPrice: Number(newItem.unitPrice ?? 0),
+        price: Number(newItem.price ?? newItem.unitPrice ?? 0),
+        costPrice: Number(newItem.costPrice ?? newItem.unitPrice ?? 0),
+        stockQty: Number(newItem.stockQty ?? 0),
+        reorderLevel: Number(newItem.reorderLevel ?? 0),
+        requireShiftCount: Number(Boolean(newItem.requireShiftCount)),
+        taxCode: newItem.taxCode ?? 'A',
+        taxType: newItem.taxType ?? (newItem.taxCode ?? 'A'),
+        country: newItem.country ?? 'KE',
+        currency: newItem.currency ?? 'KES',
+        productType: Number(newItem.productType ?? 1),
+        unit: newItem.unit ?? 'Pieces',
+      } as any);
+    } catch (error) {
+      console.error('Error saving shop item to database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Staff', userRole || 'Manager', 'PRODUCT_REGISTERED', 'Shop', `Registered new item: ${newItem.name} (${newItem.code}) at KES ${newItem.unitPrice}`);
+
+    res.json(newItem);
+  });
+
+  app.put('/api/shop/:id', (req, res) => {
+    const { id } = req.params;
+    const { name, code, category, unitPrice, price, costPrice, stockQty, reorderLevel, requireShiftCount, taxCode, taxType, country, currency, productType, unit, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'UPDATE_SHOP_ITEM', 'Shop item update');
+    if (permCheck) return permCheck;
+
+    const itemIndex = shopItems.findIndex((s) => s.id === id);
+    if (itemIndex === -1) {
+      return res.status(404).json({ message: 'Shop item not found.' });
+    }
+
+    const existingItem = shopItems[itemIndex];
+    const nextTaxCode = String(taxType || taxCode || existingItem.taxCode || 'A').toUpperCase();
+    const normalizedCountry = String(country || existingItem.country || 'KE').toUpperCase();
+    const normalizedCurrency = String(currency || existingItem.currency || 'KES').toUpperCase();
+    const normalizedUnit = String(unit || existingItem.unit || 'Pieces');
+    const normalizedProductType = Number(productType ?? existingItem.productType ?? 1);
+
+    shopItems[itemIndex] = {
+      ...existingItem,
+      code: String(code || existingItem.code),
+      name: String(name || existingItem.name),
+      category: String(category || existingItem.category || 'General'),
+      unitPrice: Number(unitPrice ?? price ?? existingItem.unitPrice ?? 0),
+      price: Number(price ?? unitPrice ?? existingItem.price ?? existingItem.unitPrice ?? 0),
+      costPrice: Number(costPrice ?? existingItem.costPrice ?? 0),
+      stockQty: Number(stockQty ?? existingItem.stockQty ?? 0),
+      reorderLevel: Number(reorderLevel ?? existingItem.reorderLevel ?? 5),
+      requireShiftCount: Boolean(requireShiftCount ?? existingItem.requireShiftCount ?? true),
+      taxCode: nextTaxCode as any,
+      taxType: nextTaxCode as any,
+      country: normalizedCountry as any,
+      currency: normalizedCurrency as any,
+      productType: [1, 2, 3].includes(normalizedProductType) ? normalizedProductType as 1 | 2 | 3 : 1,
+      unit: normalizedUnit as any,
+    };
+
+    try {
+      db.shopItemQueries.update(id, {
+        code: shopItems[itemIndex].code,
+        name: shopItems[itemIndex].name,
+        category: shopItems[itemIndex].category,
+        unitPrice: Number(shopItems[itemIndex].unitPrice ?? 0),
+        price: Number(shopItems[itemIndex].price ?? shopItems[itemIndex].unitPrice ?? 0),
+        costPrice: Number(shopItems[itemIndex].costPrice ?? 0),
+        stockQty: Number(shopItems[itemIndex].stockQty ?? 0),
+        reorderLevel: Number(shopItems[itemIndex].reorderLevel ?? 0),
+        requireShiftCount: Number(Boolean(shopItems[itemIndex].requireShiftCount)),
+        taxCode: shopItems[itemIndex].taxCode ?? 'A',
+        taxType: shopItems[itemIndex].taxType ?? (shopItems[itemIndex].taxCode ?? 'A'),
+        country: shopItems[itemIndex].country ?? 'KE',
+        currency: shopItems[itemIndex].currency ?? 'KES',
+        productType: Number(shopItems[itemIndex].productType ?? 1),
+        unit: shopItems[itemIndex].unit ?? 'Pieces',
+      } as any);
+    } catch (error) {
+      console.error('Error updating shop item in database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'PRODUCT_UPDATED', 'Shop', `Updated shop item ${shopItems[itemIndex].name} (${shopItems[itemIndex].code})`);
+    res.json(shopItems[itemIndex]);
+  });
+
+  app.delete('/api/shop/:id', (req, res) => {
+    const { id } = req.params;
+    const { userId, userName, userRole } = req.body || {};
+    const permCheck = requirePermission(req, res, 'DELETE_SHOP_ITEM', 'Shop item deletion');
+    if (permCheck) return permCheck;
+
+    const itemIndex = shopItems.findIndex((s) => s.id === id);
+    if (itemIndex === -1) {
+      return res.status(404).json({ message: 'Shop item not found.' });
+    }
+
+    const [deletedItem] = shopItems.splice(itemIndex, 1);
+    try {
+      db.shopItemQueries.delete(id);
+    } catch (error) {
+      console.error('Error deleting shop item from database:', error);
+    }
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'PRODUCT_DELETED', 'Shop', `Deleted shop item ${deletedItem.name} (${deletedItem.code})`);
+    res.json({ success: true, deletedItem });
+  });
+
+  app.post('/api/shop/bulk', (req, res) => {
+    const { items, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'BULK_UPLOAD_SHOP_ITEMS', 'Bulk shop upload');
+    if (permCheck) return permCheck;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'No items provided for bulk upload.' });
+    }
+
+    const allowedTaxCodes = ['A', 'B', 'C', 'D', 'E'];
+    const addedItems: ShopItem[] = [];
+    items.forEach((row: any, idx: number) => {
+      const normalizedTaxCode = String(row.taxType || row.taxCode || row.tax || 'A').toUpperCase();
+      if (!allowedTaxCodes.includes(normalizedTaxCode)) {
+        return;
+      }
+
+      const rawPrice = Number(row.price ?? row.unitPrice ?? row.salePrice ?? 0);
+      const normalizedCountry = String(row.country || 'KE').toUpperCase();
+      const normalizedCurrency = String(row.currency || 'KES').toUpperCase();
+      const normalizedUnit = String(row.unit || 'Pieces');
+      const normalizedProductType = Number(row.productType ?? row.product_type ?? 1);
+
+      const newItem: ShopItem = {
+        id: 'shp-' + (Date.now() + idx),
+        code: row.code || `XLS-${Math.floor(1000 + Math.random() * 9000)}`,
+        name: row.name || `Uploaded Product ${idx + 1}`,
+        category: row.category || 'General',
+        unitPrice: Number(rawPrice),
+        price: Number(rawPrice),
+        costPrice: Number(row.costPrice || row.cost || rawPrice * 0.8),
+        stockQty: Number(row.stockQty || row.qty || 0),
+        reorderLevel: Number(row.reorderLevel || 5),
+        requireShiftCount: Boolean(row.requireShiftCount),
+        taxCode: normalizedTaxCode as any,
+        taxType: normalizedTaxCode as any,
+        country: normalizedCountry as any,
+        currency: normalizedCurrency as any,
+        productType: [1, 2, 3].includes(normalizedProductType) ? (normalizedProductType as 1 | 2 | 3) : 1,
+        unit: (normalizedUnit as any),
+      };
+      shopItems.unshift(newItem);
+      addedItems.push(newItem);
+
+      try {
+        db.shopItemQueries.create({
+          id: newItem.id,
+          code: newItem.code,
+          name: newItem.name,
+          category: newItem.category,
+          unitPrice: Number(newItem.unitPrice ?? 0),
+          price: Number(newItem.price ?? newItem.unitPrice ?? 0),
+          costPrice: Number(newItem.costPrice ?? newItem.unitPrice ?? 0),
+          stockQty: Number(newItem.stockQty ?? 0),
+          reorderLevel: Number(newItem.reorderLevel ?? 0),
+          requireShiftCount: Number(Boolean(newItem.requireShiftCount)),
+          taxCode: newItem.taxCode ?? 'A',
+          taxType: newItem.taxType ?? (newItem.taxCode ?? 'A'),
+          country: newItem.country ?? 'KE',
+          currency: newItem.currency ?? 'KES',
+          productType: Number(newItem.productType ?? 1),
+          unit: newItem.unit ?? 'Pieces',
+        } as any);
+      } catch (error) {
+        console.error('Error saving bulk shop item to database:', error);
+      }
+    });
+
+    addAuditLog(userId || 'sys', userName || 'Manager', userRole || 'Admin', 'EXCEL_ITEMS_UPLOADED', 'Shop', `Imported ${addedItems.length} items via Excel spreadsheet sheet batch upload.`);
+
+    res.json({ message: `Successfully uploaded ${addedItems.length} items from Excel sheet.`, items: addedItems });
+  });
+
+  app.post('/api/shop/adjust', (req, res) => {
+    const { itemId, newQty, reason, userId, userName, userRole } = req.body;
+    const permCheck = requirePermission(req, res, 'ADJUST_STOCK', 'Shop stock adjustment');
+    if (permCheck) return permCheck;
+
+    const item = shopItems.find((s) => s.id === itemId);
+    if (!item) return res.status(404).json({ message: 'Shop item not found' });
+
+    const oldQty = item.stockQty;
+    item.stockQty = Number(newQty);
+
+    try {
+      db.shopItemQueries.update(item.id, { stockQty: item.stockQty } as any);
+    } catch (error) {
+      item.stockQty = oldQty;
+      console.error('Error saving shop stock adjustment to database:', error);
+      return res.status(500).json({ message: 'Shop stock adjustment could not be saved.' });
+    }
+
+    addAuditLog(
+      userId,
+      userName,
+      userRole,
+      'STOCK_ADJUSTMENT',
+      'Shop',
+      `Adjusted stock for ${item.name} from ${oldQty} to ${newQty}. Reason: ${reason}`
+    );
+
+    res.json(item);
+  });
+
+  // Sales & Tax Invoicing
+  app.get('/api/sales', (req, res) => {
+    res.json(transactions.map((tx) => normalizeStoredTransaction(tx)));
+  });
+
+  app.get('/api/shifts/active', (req, res) => {
+    const activeShift = hydrateShiftSummaries().find((shift) => shift.status === 'Active');
+    res.json(activeShift ?? null);
+  });
+
+  app.post('/api/sales', (req, res) => {
+    const { shiftId, staffId, staffName, type, items, paymentMethod, paymentRef, customerName, vehiclePlate, customerPin, documentType } = req.body;
+
+    const shift = shifts.find((s) => s.id === shiftId);
+    if (!shift || shift.status !== 'Active') {
+      return res.status(400).json({ message: 'Must be clocked into an active shift to process sales.' });
+    }
+    const actingUser = (req as any).authUser as User | undefined;
+    if (!actingUser || shift.staffId !== actingUser.id) {
+      return res.status(403).json({ message: 'Sales must be recorded against the authenticated user\'s active shift.' });
+    }
+
+    const requestedDocumentType = documentType === 'Invoice' ? 'Invoice' : 'Receipt';
+
+    const invalidNozzle = items.find((item: any) => {
+      if (item.type !== 'Fuel') return false;
+      const nozzleId = item.nozzleId || item.pumpId;
+      const nozzle = pumps.find((entry) => entry.id === nozzleId);
+      const tank = nozzle ? tanks.find((entry) => entry.id === nozzle.tankId) : null;
+      return !nozzle
+        || nozzle.status !== 'Active'
+        || nozzle.fuelProductId !== item.itemId
+        || !tank
+        || tank.fuelProductId !== nozzle.fuelProductId
+        || Number(tank.currentLevelLiters ?? 0) < Number(item.qty ?? 0);
+    });
+    if (invalidNozzle) {
+      return res.status(400).json({ message: 'Fuel sale rejected: select an active nozzle configured for this product with sufficient stock in its source tank.' });
+    }
+
+    const saleLines = items.map((item: any) => {
+      const qty = Number(item.qty ?? 0);
+      const unitPrice = Number(item.unitPrice ?? 0);
+      const taxCode = normalizeTaxCode(String(item.taxCode || (item.type === 'Fuel' ? 'B' : 'A')).toUpperCase());
+      return {
+        quantity: qty,
+        unitPrice,
+        taxCode,
+      };
+    });
+    const computedTotals = computeDocumentTotals(saleLines);
+
+    const formattedItems = items.map((item: any, index: number) => {
+      const itemTotal = Number(item.qty) * Number(item.unitPrice);
+      const taxCode = normalizeTaxCode(String(item.taxCode || (item.type === 'Fuel' ? 'B' : 'A')).toUpperCase());
+      const lineTotals = computedTotals.items[index] ?? {
+        grossAmount: itemTotal,
+        taxAmount: 0,
+        netAmount: itemTotal,
+        taxCode,
+        taxRate: TAX_RATE_MAP[taxCode] ?? 0,
+      };
+      return { item, itemTotal, tax: lineTotals.taxAmount, taxCode };
+    });
+    const totalAmount = computedTotals.totalAmount;
+    const totalTax = computedTotals.taxAmount;
+
+    let matchedCustomer: CustomerAccount | undefined;
+    if (paymentMethod === 'Credit') {
+      matchedCustomer = customers.find(
+        (c) =>
+          (customerPin && c.kraPin?.toLowerCase() === customerPin.toLowerCase()) ||
+          (customerName && c.name.toLowerCase() === customerName.toLowerCase()) ||
+          (c.vehicles && vehiclePlate && c.vehicles.some((v) => v.toLowerCase().replace(/\s+/g, '') === vehiclePlate.toLowerCase().replace(/\s+/g, '')))
+      );
+
+      if (requestedDocumentType === 'Invoice') {
+        if (!matchedCustomer) {
+          return res.status(400).json({
+            message: 'No recognised customer account found for this credit invoice. Add the customer or switch to Receipt mode.',
+          });
+        }
+        if (matchedCustomer.status !== 'Active') {
+          return res.status(400).json({ message: `Customer account '${matchedCustomer.name}' is ${matchedCustomer.status}. Credit sales blocked.` });
+        }
+        if (matchedCustomer.currentBalance + totalAmount > matchedCustomer.creditLimit) {
+          const avail = Math.max(0, matchedCustomer.creditLimit - matchedCustomer.currentBalance);
+          return res.status(400).json({
+            message: `CREDIT LIMIT EXCEEDED! ${matchedCustomer.name} Limit: KES ${matchedCustomer.creditLimit.toLocaleString()}, Outstanding Debt: KES ${matchedCustomer.currentBalance.toLocaleString()}, Available: KES ${avail.toLocaleString()}. Invoice total KES ${totalAmount.toLocaleString()} rejected.`,
+          });
+        }
+      }
+    }
+
+    const saleMovementEntries: Array<{
+      itemId: string;
+      nozzleId?: string;
+      name: string;
+      code?: string;
+      type: 'Fuel' | 'Shop';
+      previousQty: number;
+      newQty: number;
+      qtySold: number;
+    }> = [];
+
+    const finalItems = formattedItems.map(({ item, itemTotal, tax, taxCode }) => {
+      const qtySold = Number(item.qty);
+      let previousQty = 0;
+      let nextQty = 0;
+
+      if (item.type === 'Fuel') {
+        const nozzleId = item.nozzleId || item.pumpId;
+        const nozzle = pumps.find((entry) => entry.id === nozzleId);
+        if (!nozzle) {
+          throw new Error(`Fuel sale rejected: nozzle ${nozzleId} not found.`);
+        }
+
+        if (nozzle.fuelProductId !== item.itemId) {
+          throw new Error(`Fuel sale rejected: nozzle ${nozzle.nozzleName || nozzle.pumpName} does not match the selected product.`);
+        }
+
+        const tank = tanks.find((t) => t.id === nozzle.tankId);
+        if (tank) {
+          previousQty = Number(tank.currentLevelLiters ?? 0);
+          tank.currentLevelLiters = Math.max(0, previousQty - qtySold);
+          nextQty = Number(tank.currentLevelLiters ?? 0);
+        }
+
+        nozzle.currentMeterReading += qtySold;
+      } else if (item.type === 'Shop') {
+        const shopItem = shopItems.find((s) => s.id === item.itemId);
+        if (shopItem) {
+          previousQty = Number(shopItem.stockQty ?? 0);
+          shopItem.stockQty = Math.max(0, previousQty - qtySold);
+          nextQty = Number(shopItem.stockQty ?? 0);
+        }
+      }
+
+      saleMovementEntries.push({
+        itemId: item.itemId,
+        nozzleId: item.type === 'Fuel' ? (item.nozzleId || item.pumpId) : undefined,
+        name: item.name,
+        code: (item as any)?.code,
+        type: item.type,
+        previousQty,
+        newQty: nextQty,
+        qtySold,
+      });
+
+      return {
+        itemId: item.itemId,
+        pumpId: item.pumpId || item.nozzleId,
+        nozzleId: item.nozzleId || item.pumpId,
+        name: item.name,
+        type: item.type,
+        qty: Number(item.qty),
+        unitPrice: Number(item.unitPrice),
+        totalPrice: itemTotal,
+        taxAmount: tax,
+        taxCode: taxCode as any,
+      };
+    });
+
+    const invoiceNum = generateInvoiceNumber();
+    const receiptNum = generateReceiptNumber();
+
+    const newTx: Transaction = {
+      id: 'tx-' + Date.now(),
+      receiptNo: receiptNum,
+      taxInvoiceNo: invoiceNum,
+      qrCodeUrl: `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(`${invoiceNum}|${computedTotals.totalAmount.toFixed(2)}`)}`,
+      timestamp: new Date().toISOString(),
+      shiftId,
+      staffId: actingUser.id,
+      staffName: actingUser.name,
+      type: type || 'Fuel',
+      items: finalItems.map((item) => ({
+        ...item,
+        totalPrice: Number(item.qty) * Number(item.unitPrice),
+        taxAmount: computedTotals.items.find((line) => line.taxCode === item.taxCode && line.quantity === Number(item.qty) && Math.abs(line.unitPrice - Number(item.unitPrice)) < 0.0001)?.taxAmount ?? 0,
+        taxableAmount: computedTotals.items.find((line) => line.taxCode === item.taxCode && line.quantity === Number(item.qty) && Math.abs(line.unitPrice - Number(item.unitPrice)) < 0.0001)?.netAmount ?? 0,
+      })),
+      subtotal: computedTotals.subtotal,
+      taxAmount: computedTotals.taxAmount,
+      totalAmount: computedTotals.totalAmount,
+      paymentMethod,
+      paymentRef: paymentRef || (paymentMethod === 'M-Pesa' ? `MP${Math.random().toString(36).substring(2, 9).toUpperCase()}` : undefined),
+      customerName: matchedCustomer ? matchedCustomer.name : (customerName || 'Walk-in Customer'),
+      vehiclePlate,
+      customerPin: matchedCustomer ? matchedCustomer.kraPin : customerPin,
+      status: 'Completed',
+      documentType: requestedDocumentType,
+    } as Transaction;
+
+    transactions.unshift(newTx);
+
+    const documentReference = requestedDocumentType === 'Invoice' ? newTx.taxInvoiceNo : newTx.receiptNo;
+    for (const movement of saleMovementEntries) {
+      if (!movement.qtySold || movement.qtySold <= 0) continue;
+
+      const previousQty = Number(movement.previousQty ?? 0);
+      const nextQty = Number(movement.newQty ?? 0);
+      const stockDifference = nextQty - previousQty;
+
+      if (Number.isNaN(stockDifference) || stockDifference >= 0) {
+        continue;
+      }
+
+      createStockAdjustmentRecord({
+        type: movement.type,
+        itemId: movement.itemId,
+        itemName: movement.name,
+        itemCode: movement.code,
+        previousQty,
+        newQty: nextQty,
+        reason: 'Item Sold',
+        userId: actingUser.id,
+        userName: actingUser.name,
+        userRole: 'Fuel Attendant',
+        source: 'Sales Transaction',
+        referenceNumber: documentReference,
+        originalDocumentNumber: documentReference,
+        movementType: 'SALE',
+        notes: `Stock reduced during sale ${documentReference}. Quantity sold: ${movement.qtySold}.`,
+      });
+    }
+
+    try {
+      const fuelSaleItem = items.find((item: any) => item.type === 'Fuel');
+      const selectedPumpId = fuelSaleItem?.pumpId ?? null;
+      const selectedNozzleId = fuelSaleItem?.nozzleId ?? fuelSaleItem?.pumpId ?? null;
+      const validPumpId = selectedNozzleId && pumps.some((pump) => pump.id === selectedNozzleId) ? selectedNozzleId : null;
+      const fuelProductId = finalItems.find((item) => item.type === 'Fuel')?.itemId ?? null;
+      const validProductId = fuelProductId && products.some((product) => product.id === fuelProductId) ? fuelProductId : null;
+      const validAttendantId = actingUser.id;
+      const validShiftId = shifts.some((shift) => shift.id === shiftId) ? shiftId : null;
+      const validCustomerId = matchedCustomer && customers.some((customer) => customer.id === matchedCustomer.id) ? matchedCustomer.id : null;
+
+      const txRecord = {
+        id: newTx.id,
+        date: new Date(newTx.timestamp).toISOString().slice(0, 10),
+        time: new Date(newTx.timestamp).toISOString().slice(11, 19),
+        pumpId: validPumpId,
+        nozzleId: validPumpId,
+        itemsJson: JSON.stringify(newTx.items),
+        productId: validProductId,
+        quantity: finalItems.reduce((sum, item) => sum + Number(item.qty || 0), 0),
+        unitPrice: finalItems.reduce((sum, item) => sum + Number(item.unitPrice || 0), 0) / Math.max(finalItems.length, 1),
+        subtotal: Number(newTx.subtotal ?? 0),
+        tax: Number(newTx.taxAmount ?? 0),
+        totalAmount: Number(newTx.totalAmount ?? 0),
+        paymentMethod: newTx.paymentMethod,
+        attendantId: validAttendantId,
+        attendantName: validAttendantId ? staffName : null,
+        meterReadingBefore: null,
+        meterReadingAfter: null,
+        receiptNumber: newTx.receiptNo,
+        invoiceNumber: newTx.taxInvoiceNo,
+        documentType: requestedDocumentType,
+        customerName: newTx.customerName || customerName || 'Walk-in Customer',
+        customerPin: newTx.customerPin || customerPin || null,
+        vehiclePlate: newTx.vehiclePlate || vehiclePlate || null,
+        status: newTx.status,
+        shiftId: validShiftId,
+        customerId: validCustomerId,
+        notes: matchedCustomer ? `Credit sale for ${matchedCustomer.name}` : customerName ? `Sale for ${customerName}` : null,
+      };
+
+      const sqlite = getSqlite();
+      const persistSale = sqlite.transaction(() => {
+        db.transactionQueries.create(txRecord as any);
+        db.cashFlowQueries.create({
+          id: 'cf-' + Date.now(),
+          date: new Date(newTx.timestamp).toISOString().slice(0, 10),
+          type: 'Inflow',
+          category: type === 'Shop' ? 'Shop Sales' : 'Fuel Sales',
+          description: `${type || 'Fuel'} Sale ${newTx.receiptNo} - ${newTx.customerName}${vehiclePlate ? ` (${vehiclePlate})` : ''}`,
+          amount: Number(totalAmount || 0),
+          accountingMethod: paymentMethod,
+          referenceNo: newTx.taxInvoiceNo || newTx.receiptNo,
+          relatedTransactionId: newTx.id,
+          relatedDeliveryId: null,
+          relatedPaymentId: null,
+          recordedBy: actingUser.id,
+          recordedByName: actingUser.name,
+          approvedBy: null,
+          approvedByName: null,
+          notes: paymentMethod === 'Credit' ? `Credit sale to ${newTx.customerName}` : null,
+          status: 'Recorded',
+        } as any);
+
+        for (const movement of saleMovementEntries) {
+          if (movement.type === 'Shop') {
+            const shopItem = shopItems.find((item) => item.id === movement.itemId);
+            if (shopItem) {
+              db.shopItemQueries.update(shopItem.id, { stockQty: shopItem.stockQty } as any);
+            }
+            continue;
+          }
+
+          const pump = pumps.find((item) => item.id === movement.nozzleId);
+          const tank = tanks.find((item) => item.id === pump?.tankId);
+          if (pump) {
+            db.pumpQueries.update(pump.id, { currentMeterReading: pump.currentMeterReading } as any);
+            db.nozzleReadingQueries.create({
+              id: `nr-${newTx.id}-${pump.id}`,
+              nozzleId: pump.id,
+              pumpId: pump.physicalPumpId || null,
+              tankId: pump.tankId,
+              fuelProductId: pump.fuelProductId,
+              shiftId: validShiftId,
+              transactionId: newTx.id,
+              previousReading: Number(pump.currentMeterReading) - Number(movement.qtySold),
+              quantityDispensed: Number(movement.qtySold),
+              currentReading: Number(pump.currentMeterReading),
+              readingType: 'Sale',
+              recordedBy: validAttendantId,
+              timestamp: newTx.timestamp,
+            } as any);
+          }
+          if (tank) {
+            db.tankQueries.update(tank.id, {
+              currentLevelLiters: tank.currentLevelLiters,
+              lastDipReading: tank.lastDipReading,
+              lastDipTime: tank.lastDipTime,
+            } as any);
+          }
+        }
+      });
+
+      persistSale();
+    } catch (error) {
+      console.error('Error saving transaction to database:', error);
+      throw error;
+    }
+
+    if (paymentMethod === 'Credit' && matchedCustomer && requestedDocumentType === 'Invoice') {
+      matchedCustomer.currentBalance += totalAmount;
+      try {
+        db.customerQueries.update(matchedCustomer.id, {
+          businessName: matchedCustomer.name,
+          contactPerson: matchedCustomer.name,
+          email: matchedCustomer.email ?? null,
+          phone: matchedCustomer.phone || '',
+          address: matchedCustomer.address ?? null,
+          accountType: 'Corporate',
+          creditLimit: Number(matchedCustomer.creditLimit ?? 0),
+          currentDebt: Number(matchedCustomer.currentBalance ?? 0),
+          status: matchedCustomer.status || 'Active',
+          taxId: matchedCustomer.kraPin ?? null,
+        } as any);
+      } catch (error) {
+        console.error('Error syncing customer credit balance to database:', error);
+      }
+    }
+
+    const completedSaleCashFlow: CashFlowRecord = {
+      id: 'cf-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      type: 'Inflow',
+      category: type === 'Shop' ? 'Shop Sales' : 'Fuel Sales',
+      amount: totalAmount,
+      paymentMethod,
+      referenceNo: newTx.taxInvoiceNo || newTx.receiptNo,
+      description: `${type || 'Fuel'} Sale ${newTx.receiptNo} - ${newTx.customerName}${vehiclePlate ? ` (${vehiclePlate})` : ''}`,
+      recordedBy: staffName || 'Attendant',
+    };
+    cashFlow.unshift(completedSaleCashFlow);
+
+    const hydratedShifts = rebuildShiftSummaries(shifts, transactions);
+    const matchIndex = hydratedShifts.findIndex((item) => item.id === shift.id);
+    if (matchIndex >= 0) {
+      const hydratedShift = hydratedShifts[matchIndex];
+      shift.totalFuelSales = hydratedShift.totalFuelSales;
+      shift.totalShopSales = hydratedShift.totalShopSales;
+      shift.totalExpectedCash = hydratedShift.totalExpectedCash;
+      shifts[matchIndex] = hydratedShift;
+    }
+
+    addAuditLog(
+      actingUser.id,
+      actingUser.name,
+      actingUser.role,
+      'SALE_COMPLETED',
+      'Sales',
+      `Processed sale ${newTx.receiptNo} (Invoice: ${newTx.taxInvoiceNo}) for KES ${totalAmount.toFixed(2)} via ${paymentMethod}`
+    );
+
+    res.json(newTx);
+  });
+
+  // Shifts
+  app.get('/api/shifts', (req: any, res) => {
+    const canSeeLiveExpectedCash = isAdminRole(req.authUser?.role);
+    const visibleShifts = hydrateShiftSummaries().sort((left, right) => {
+      const leftTime = Date.parse(left.endTime || left.startTime || '') || 0;
+      const rightTime = Date.parse(right.endTime || right.startTime || '') || 0;
+      return rightTime - leftTime;
+    }).map((shift) => {
+      // Do not send an active shift's expected drawer amount to attendants.
+      // The server derives the comparison after submission; staff receive it
+      // only in the completed reconciliation history.
+      if (shift.status !== 'Active' || canSeeLiveExpectedCash) return shift;
+      const { totalExpectedCash: _expectedCash, ...safeShift } = shift;
+      return safeShift;
+    });
+    res.json(visibleShifts);
+  });
+
+  const deriveAssignmentStatus = (assignment: any, plan: any, linkedShift: any, now = Date.now()) => {
+    if (assignment.status === 'Cancelled' || assignment.status === 'Removed From Assignment') return 'Cancelled';
+    const startTime = Date.parse(plan.scheduled_start);
+    const endTime = Date.parse(plan.scheduled_end);
+    const hasValidClockIn = Boolean(linkedShift && assignment.clock_in_shift_id === linkedShift.id && linkedShift.staffId === assignment.user_id);
+    if (hasValidClockIn && linkedShift.endTime) return 'Completed';
+    if (hasValidClockIn) return 'In Progress';
+    if (Number.isFinite(endTime) && now > endTime) return 'Stale';
+    if (Number.isFinite(startTime) && now >= startTime) return 'Due';
+    return 'Upcoming';
+  };
+
+  const reconcileRosterAssignments = () => {
+    const sqlite = getSqlite();
+    const plans = sqlite.prepare('SELECT id, scheduled_start, scheduled_end FROM shift_plans').all() as any[];
+    const planById = new Map(plans.map((plan) => [plan.id, plan]));
+    const shiftById = new Map(hydrateShiftSummaries().map((shift) => [shift.id, shift]));
+    const assignments = sqlite.prepare('SELECT * FROM shift_assignments').all() as any[];
+    const update = sqlite.prepare('UPDATE shift_assignments SET status = ? WHERE id = ? AND status <> ?');
+    const now = Date.now();
+    assignments.forEach((assignment) => {
+      const plan = planById.get(assignment.shift_plan_id);
+      if (!plan) return;
+      const derivedStatus = deriveAssignmentStatus(assignment, plan, shiftById.get(assignment.clock_in_shift_id), now);
+      update.run(derivedStatus, assignment.id, derivedStatus);
+    });
+  };
+
+  const getShiftPlans = () => {
+    reconcileRosterAssignments();
+    const sqlite = getSqlite();
+    const plans = sqlite.prepare('SELECT * FROM shift_plans ORDER BY scheduled_start DESC').all() as any[];
+    const assignments = sqlite.prepare(`
+      SELECT assignment.*, user.name AS user_name, user.role AS user_role
+      FROM shift_assignments assignment
+      JOIN users user ON user.id = assignment.user_id
+      ORDER BY assignment.assigned_at ASC
+    `).all() as any[];
+
+    return plans.map((plan) => ({
+      id: plan.id,
+      name: plan.name,
+      shiftType: plan.shift_type,
+      scheduledStart: plan.scheduled_start,
+      scheduledEnd: plan.scheduled_end,
+      status: plan.status,
+      recurrenceId: plan.recurrence_id || null,
+      createdBy: plan.created_by,
+      createdAt: plan.created_at,
+      assignments: assignments.filter((assignment) => assignment.shift_plan_id === plan.id).map((assignment) => ({
+        id: assignment.id,
+        shiftPlanId: assignment.shift_plan_id,
+        userId: assignment.user_id,
+        userName: assignment.user_name,
+        userRole: assignment.user_role,
+        status: deriveAssignmentStatus(assignment, plan, hydrateShiftSummaries().find((shift) => shift.id === assignment.clock_in_shift_id)),
+        assignedAt: assignment.assigned_at,
+        assignedBy: assignment.assigned_by,
+        removedAt: assignment.removed_at,
+        removedBy: assignment.removed_by,
+        clockInShiftId: assignment.clock_in_shift_id,
+        clockInTime: assignment.clock_in_time,
+        clockOutTime: assignment.clock_out_time,
+      })),
+    }));
+  };
+
+  const shiftManagementRoleCheck = (req: any, res: any, permission: Permission, action: string) => Boolean(requirePermission(req, res, permission, action));
+
+  app.get('/api/shift-plans', (req, res) => {
+    if (!(req as any).authUser) return res.status(401).json({ message: 'Authentication is required to view shift rosters.' });
+    const actor = (req as any).authUser as User;
+    const plans = getShiftPlans();
+    if (hasPermission(actor, 'VIEW_SHIFT_USERS')) return res.json(plans);
+    // Staff can only receive their own roster assignments; never leak co-workers.
+    res.json(plans
+      .map((plan) => ({ ...plan, assignments: plan.assignments.filter((assignment) => assignment.userId === actor.id) }))
+      .filter((plan) => plan.assignments.length > 0));
+  });
+
+  app.post('/api/shift-plans', (req: any, res) => {
+    if (shiftManagementRoleCheck(req, res, 'CREATE_SHIFT', 'create shifts')) return;
+    const { name, shiftType, scheduledStart, scheduledEnd, userIds, scheduleMode, recurrenceStartDate, recurrenceEndDate, recurrenceWeekdays, dailyStartTime, dailyEndTime } = req.body || {};
+    const assignedUserIds = [...new Set((Array.isArray(userIds) ? userIds : []).map(String).filter(Boolean))];
+    const isRecurring = scheduleMode === 'recurring';
+    if (!String(name || '').trim() || !String(shiftType || '').trim() || (!isRecurring && (!scheduledStart || !scheduledEnd))) {
+      return res.status(400).json({ message: 'Shift name, type, scheduled start, and scheduled end are required.' });
+    }
+    if (!isRecurring && Date.parse(scheduledEnd) <= Date.parse(scheduledStart)) {
+      return res.status(400).json({ message: 'Scheduled end must be after scheduled start.' });
+    }
+    const weekdays = Array.isArray(recurrenceWeekdays) ? [...new Set(recurrenceWeekdays.map(Number).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))] : [];
+    if (isRecurring && (!recurrenceStartDate || !recurrenceEndDate || !dailyStartTime || !dailyEndTime || weekdays.length === 0)) {
+      return res.status(400).json({ message: 'Recurring shifts require a date range, daily times, and at least one weekday.' });
+    }
+    if (isRecurring && (recurrenceEndDate < recurrenceStartDate || dailyEndTime <= dailyStartTime)) {
+      return res.status(400).json({ message: 'Recurring end date must not precede start date, and each occurrence must end after it starts.' });
+    }
+    const assignedUsers = users.filter((user) => assignedUserIds.includes(user.id) && user.active);
+    if (assignedUsers.length !== assignedUserIds.length) {
+      return res.status(400).json({ message: 'One or more selected users are unavailable.' });
+    }
+
+    const now = new Date().toISOString();
+    const planId = `shift-plan-${randomUUID()}`;
+    let createdRecurrenceId: string | null = null;
+    try {
+      getSqlite().transaction(() => {
+        const insertPlan = getSqlite().prepare(`INSERT OR IGNORE INTO shift_plans (id, name, shift_type, scheduled_start, scheduled_end, status, created_by, created_at, updated_at, recurrence_id)
+          VALUES (?, ?, ?, ?, ?, 'Scheduled', ?, ?, ?, ?)`);
+        const insertAssignment = getSqlite().prepare(`INSERT INTO shift_assignments (id, shift_plan_id, user_id, status, assigned_at, assigned_by)
+          VALUES (?, ?, ?, 'Assigned', ?, ?)`);
+        const createOccurrence = (occurrenceId: string, occurrenceStart: string, occurrenceEnd: string, recurrenceId: string | null) => {
+          const result = insertPlan.run(occurrenceId, String(name).trim(), String(shiftType).trim(), occurrenceStart, occurrenceEnd, req.authUser.id, now, now, recurrenceId);
+          if (result.changes) assignedUsers.forEach((user) => insertAssignment.run(`shift-assignment-${randomUUID()}`, occurrenceId, user.id, now, req.authUser.id));
+        };
+        if (!isRecurring) createOccurrence(planId, scheduledStart, scheduledEnd, null);
+        else {
+          const recurrenceId = `shift-recurrence-${randomUUID()}`;
+          createdRecurrenceId = recurrenceId;
+          getSqlite().prepare(`INSERT INTO shift_recurrences (id, name, shift_type, start_date, end_date, start_time, end_time, weekdays_json, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(recurrenceId, String(name).trim(), String(shiftType).trim(), recurrenceStartDate, recurrenceEndDate, dailyStartTime, dailyEndTime, JSON.stringify(weekdays), req.authUser.id, now);
+          for (const date = new Date(`${recurrenceStartDate}T00:00:00`); date <= new Date(`${recurrenceEndDate}T00:00:00`); date.setDate(date.getDate() + 1)) {
+            if (!weekdays.includes(date.getDay())) continue;
+            const day = date.toISOString().slice(0, 10);
+            const occurrenceStart = new Date(`${day}T${dailyStartTime}`).toISOString();
+            const occurrenceEnd = new Date(`${day}T${dailyEndTime}`).toISOString();
+            createOccurrence(`shift-plan-${recurrenceId}-${day}`, occurrenceStart, occurrenceEnd, recurrenceId);
+          }
+        }
+      })();
+    } catch (error) {
+      console.error('Error creating shift plan:', error);
+      return res.status(500).json({ message: 'Shift could not be created.' });
+    }
+
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'SHIFT_CREATED', 'Shifts', `Created ${name} (${shiftType}) scheduled ${scheduledStart} to ${scheduledEnd}; assigned ${assignedUsers.map((user) => user.name).join(', ') || 'no users'}.`);
+    res.status(201).json(isRecurring ? getShiftPlans().find((plan) => plan.recurrenceId === createdRecurrenceId) : getShiftPlans().find((plan) => plan.id === planId));
+  });
+
+  app.post('/api/shift-plans/:id/assignments', (req: any, res) => {
+    if (shiftManagementRoleCheck(req, res, 'ASSIGN_SHIFT_USERS', 'assign shift users')) return;
+    const plan = getSqlite().prepare('SELECT id FROM shift_plans WHERE id = ?').get(req.params.id) as any;
+    const user = users.find((candidate) => candidate.id === String(req.body?.userId || '') && candidate.active);
+    if (!plan) return res.status(404).json({ message: 'Shift not found.' });
+    if (!user) return res.status(404).json({ message: 'Active user not found.' });
+
+    try {
+      getSqlite().prepare(`INSERT INTO shift_assignments (id, shift_plan_id, user_id, status, assigned_at, assigned_by)
+        VALUES (?, ?, ?, 'Assigned', ?, ?)`)
+        .run(`shift-assignment-${randomUUID()}`, plan.id, user.id, new Date().toISOString(), req.authUser.id);
+    } catch (error: any) {
+      if (String(error?.message || '').includes('UNIQUE')) return res.status(409).json({ message: 'User is already assigned to this shift.' });
+      console.error('Error assigning shift user:', error);
+      return res.status(500).json({ message: 'User could not be assigned.' });
+    }
+
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'SHIFT_USER_ASSIGNED', 'Shifts', `Assigned ${user.name} to shift ${req.params.id}.`);
+    res.status(201).json(getShiftPlans().find((candidate) => candidate.id === req.params.id));
+  });
+
+  app.delete('/api/shift-plans/:id/assignments/:userId', (req: any, res) => {
+    if (shiftManagementRoleCheck(req, res, 'REMOVE_SHIFT_USERS', 'remove shift users')) return;
+    const assignment = getSqlite().prepare('SELECT * FROM shift_assignments WHERE shift_plan_id = ? AND user_id = ?').get(req.params.id, req.params.userId) as any;
+    if (!assignment) return res.status(404).json({ message: 'Shift assignment not found.' });
+    if (assignment.status === 'Removed From Assignment') return res.status(409).json({ message: 'User has already been removed from this shift.' });
+    const hasParticipation = Boolean(assignment.clock_in_shift_id || assignment.clock_in_time || assignment.clock_out_time);
+    const now = new Date().toISOString();
+    getSqlite().prepare(`UPDATE shift_assignments
+      SET status = 'Removed From Assignment', removed_at = ?, removed_by = ?
+      WHERE id = ?`).run(now, req.authUser.id, assignment.id);
+    const target = users.find((user) => user.id === assignment.user_id);
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'SHIFT_USER_REMOVED', 'Shifts', `${hasParticipation ? 'Safely removed roster access for' : 'Removed'} ${target?.name || assignment.user_id} from shift ${req.params.id}.`);
+    res.json(getShiftPlans().find((candidate) => candidate.id === req.params.id));
+  });
+
+  app.get('/api/schedules', (req, res) => {
+    if (!(req as any).authUser) return res.status(401).json({ message: 'Authentication is required to view shift rosters.' });
+    const actor = (req as any).authUser as User;
+    // Only Admin and Super Admin may view every assignment. All other users
+    // receive their own assigned schedules, even if they hold a view grant.
+    const canViewAll = isAdminRole(actor.role);
+    const projectedSchedules = getShiftPlans().flatMap((plan) => plan.assignments
+      .filter((assignment) => assignment.status !== 'Cancelled')
+      .filter((assignment) => canViewAll || assignment.userId === actor.id)
+      .map((assignment) => ({
+        id: assignment.id,
+        assignmentId: assignment.id,
+        shiftPlanId: plan.id,
+        staffId: assignment.userId,
+        staffName: assignment.userName,
+        role: assignment.userRole,
+        shiftType: plan.shiftType,
+        recurrenceId: plan.recurrenceId || null,
+        date: plan.scheduledStart.slice(0, 10),
+        startTime: plan.scheduledStart,
+        endTime: plan.scheduledEnd,
+        status: assignment.status,
+      }))
+    );
+    res.json(projectedSchedules);
+  });
+
+  app.post('/api/schedules', (_req, res) => {
+    res.status(410).json({ message: 'Legacy schedules are retired. Create a roster shift through /api/shift-plans.' });
+  });
+
+  app.delete('/api/schedules/:id', (_req, res) => {
+    res.status(410).json({ message: 'Legacy schedules are read-only. Manage roster assignments through /api/shift-plans.' });
+  });
+
+  // Clock-in
+  app.post('/api/shifts/clock-in', (req: any, res) => {
+    const { userId, pin, shiftType, openingCash, openingPumpReadings, openingTankDips, shiftPlanId } = req.body;
+    const user = users.find((u) => u.id === userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!verifyStoredPin(user.pin, pin).valid) return res.status(401).json({ message: 'Invalid user or PIN.' });
+    if (req.authUser?.id !== user.id && !hasPermission(req.authUser, 'CLOCK_IN_OTHER_USERS')) {
+      return res.status(403).json({ message: 'You may only clock into your own shift.' });
+    }
+    if (!shiftPlanId) return res.status(400).json({ message: 'A roster shift must be selected before clock-in.' });
+    reconcileRosterAssignments();
+    const assignment = getSqlite().prepare(`SELECT id, status FROM shift_assignments
+      WHERE shift_plan_id = ? AND user_id = ?`).get(shiftPlanId, user.id) as any;
+    if (!assignment) return res.status(403).json({ message: 'You are not assigned to this shift.' });
+    if (assignment.status !== 'Due') return res.status(400).json({ message: `This roster assignment is ${assignment.status.toLowerCase()} and cannot be clocked in. Only due assignments may be clocked in.` });
+    const roster = getSqlite().prepare('SELECT shift_type FROM shift_plans WHERE id = ?').get(shiftPlanId) as any;
+    if (!roster) return res.status(404).json({ message: 'Roster shift not found.' });
+
+    const existingActive = shifts.find((s) => s.staffId === user.id && s.status === 'Active');
+    if (existingActive) {
+      return res.json(existingActive);
+    }
+
+    const submittedPumpReadings = new Map<string, any>((openingPumpReadings || []).map((reading: any) => [String(reading.pumpId), reading]));
+    const formattedOpeningPumps = pumps.filter((pump) => pump.status === 'Active').map((p) => {
+      const submittedReading = submittedPumpReadings.get(p.id);
+      const authoritativeOpeningMeter = Number(p.currentMeterReading ?? 0);
+      const reportedOpeningMeter = submittedReading?.openingMeter !== undefined
+        ? Number(submittedReading.openingMeter)
+        : authoritativeOpeningMeter;
+      return {
+        pumpId: p.id,
+        pumpName: submittedReading?.pumpName || p.pumpName || 'Pump Nozzle',
+        fuelName: submittedReading?.fuelName || p.fuelName || 'Fuel',
+        // `openingMeter` is the physical reading used for this shift; retain the
+        // system value separately for later variance review.
+        openingMeter: reportedOpeningMeter,
+        authoritativeOpeningMeter,
+        reportedOpeningMeter,
+        variance: reportedOpeningMeter - authoritativeOpeningMeter,
+      };
+    });
+
+    const formattedOpeningTanks = (openingTankDips || []).map((td: any) => {
+      const t = tanks.find((tnk) => tnk.id === td.tankId);
+      const authoritativeQuantity = Number(t?.currentLevelLiters ?? 0);
+      const reportedOpeningDip = td.openingDip !== undefined ? Number(td.openingDip) : authoritativeQuantity;
+      return {
+        tankId: td.tankId,
+        tankName: td.tankName || t?.tankName || 'Fuel Tank',
+        fuelName: td.fuelName || t?.fuelName || 'Fuel',
+        openingDip: reportedOpeningDip,
+        authoritativeQuantity,
+        reportedOpeningDip,
+        variance: reportedOpeningDip - authoritativeQuantity,
+      };
+    });
+
+    const newShift: ShiftSession = {
+      id: 'shift-' + Date.now(),
+      staffId: user.id,
+      staffName: user.name,
+      staffRole: user.role as any,
+      shiftType: roster.shift_type,
+      startTime: new Date().toISOString(),
+      status: 'Active',
+      openingCash: Number(openingCash || 0),
+      openingPumpReadings: formattedOpeningPumps,
+      openingTankDips: formattedOpeningTanks,
+      totalFuelSales: 0,
+      totalShopSales: 0,
+      totalExpectedCash: Number(openingCash || 0),
+      isLate: false,
+    } as ShiftSession;
+
+    try {
+      const sqlite = getSqlite();
+      const persistShift = sqlite.transaction(() => {
+        db.shiftQueries.create({
+          id: newShift.id,
+          staffId: user.id,
+          staffName: user.name,
+          staffRole: user.role,
+          shiftType: newShift.shiftType,
+          date: new Date(newShift.startTime).toISOString().slice(0, 10),
+          startTime: newShift.startTime,
+          endTime: null,
+          status: 'Active',
+          openingCash: Number(openingCash || 0),
+          closingCash: null,
+          openingPumpReadingsJson: JSON.stringify(formattedOpeningPumps),
+          openingTankDipsJson: JSON.stringify(formattedOpeningTanks),
+        } as any);
+
+        const insertVariance = getSqlite().prepare(`INSERT INTO reading_variances
+          (id, shift_id, reading_type, tank_id, nozzle_id, reported_value, authoritative_value, variance, status, recorded_by, recorded_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Review Required', ?, ?)`);
+        formattedOpeningPumps.filter((reading) => Math.abs(Number(reading.variance || 0)) > 0.000001).forEach((reading) => {
+          const pump = pumps.find((item) => item.id === reading.pumpId);
+          if (!pump) return;
+          insertVariance.run(`variance-${randomUUID()}`, newShift.id, 'Nozzle Meter', pump.tankId, pump.id, reading.reportedOpeningMeter, reading.authoritativeOpeningMeter, reading.variance, user.id, newShift.startTime);
+        });
+        formattedOpeningTanks.filter((reading) => Math.abs(Number(reading.variance || 0)) > 0.000001).forEach((reading) => {
+          insertVariance.run(`variance-${randomUUID()}`, newShift.id, 'Tank Dip', reading.tankId, null, reading.reportedOpeningDip, reading.authoritativeQuantity, reading.variance, user.id, newShift.startTime);
+        });
+
+        db.userQueries.update(user.id, { currentShiftId: newShift.id } as any);
+        getSqlite().prepare(`UPDATE shift_assignments
+          SET clock_in_shift_id = ?, clock_in_time = ?, status = 'In Progress'
+          WHERE id = ?`)
+          .run(newShift.id, newShift.startTime, assignment.id);
+        getSqlite().prepare(`UPDATE shift_plans SET status = 'Active', updated_at = ? WHERE id = ? AND status = 'Scheduled'`)
+          .run(newShift.startTime, shiftPlanId);
+      });
+
+      persistShift();
+    } catch (error) {
+      const existingPersistedShift = db.shiftQueries.active().find((shift: any) => shift.staffId === user.id);
+      if (existingPersistedShift) {
+        user.currentShiftId = existingPersistedShift.id;
+        return res.json(existingPersistedShift);
+      }
+
+      console.error('Error saving active shift to database:', error);
+      return res.status(500).json({ message: 'Unable to open the shift. Please try again.' });
+    }
+
+    shifts.unshift(newShift);
+    user.currentShiftId = newShift.id;
+
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'SHIFT_CLOCK_IN', 'Shifts', `${user.name} clocked in for ${shiftType} shift with KES ${openingCash} float. Recorded opening meters (${formattedOpeningPumps.length} pumps) & tank dips (${formattedOpeningTanks.length} tanks).`);
+    formattedOpeningPumps.forEach((reading) => {
+      addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'METER_READING_RECORDED', 'Shifts', `Shift ${newShift.id}, nozzle ${reading.pumpId}: reported ${reading.reportedOpeningMeter}, authoritative ${reading.authoritativeOpeningMeter}, variance ${reading.variance}.`);
+      if (Math.abs(Number(reading.variance || 0)) > 0.000001) addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'METER_VARIANCE_DETECTED', 'Shifts', `Shift ${newShift.id}, nozzle ${reading.pumpId}: variance ${reading.variance}.`, 'Warning');
+    });
+    formattedOpeningTanks.forEach((reading) => {
+      addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'DIP_READING_RECORDED', 'Shifts', `Shift ${newShift.id}, tank ${reading.tankId}: reported ${reading.reportedOpeningDip}, authoritative ${reading.authoritativeQuantity}, variance ${reading.variance}.`);
+      if (Math.abs(Number(reading.variance || 0)) > 0.000001) addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'DIP_VARIANCE_DETECTED', 'Shifts', `Shift ${newShift.id}, tank ${reading.tankId}: variance ${reading.variance}.`, 'Warning');
+    });
+
+    res.json(newShift);
+  });
+
+  app.get('/api/reading-variances', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'VIEW_DIP_VARIANCE', 'view reading variances');
+    if (roleCheck) return roleCheck;
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 15)));
+    const total = Number((getSqlite().prepare('SELECT COUNT(*) AS count FROM reading_variances').get() as any).count || 0);
+    const records = getSqlite().prepare('SELECT * FROM reading_variances ORDER BY recorded_at DESC, id DESC LIMIT ? OFFSET ?')
+      .all(pageSize, (page - 1) * pageSize);
+    res.json({ records, page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
+  });
+
+  app.post('/api/reading-variances/:id/review', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'REVIEW_DIP_VARIANCE', 'review a reading variance');
+    if (roleCheck) return roleCheck;
+    const variance = getSqlite().prepare('SELECT * FROM reading_variances WHERE id = ?').get(req.params.id) as any;
+    if (!variance) return res.status(404).json({ message: 'Reading variance not found.' });
+    if (variance.status === 'Resolved') return res.status(409).json({ message: 'Resolved variances cannot be reviewed again.' });
+    const reviewedAt = new Date().toISOString();
+    getSqlite().prepare(`UPDATE reading_variances SET status = 'Reviewed', reviewed_by = ?, reviewed_at = ? WHERE id = ?`)
+      .run(req.authUser.id, reviewedAt, variance.id);
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'DIP_VARIANCE_REVIEWED', 'Shifts', `Reviewed ${variance.reading_type} variance ${variance.id} for shift ${variance.shift_id}; reported ${variance.reported_value}, authoritative ${variance.authoritative_value}, variance ${variance.variance}.`);
+    res.json(getSqlite().prepare('SELECT * FROM reading_variances WHERE id = ?').get(variance.id));
+  });
+
+  app.post('/api/reading-variances/:id/resolve', (req: any, res) => {
+    const roleCheck = requirePermission(req, res, 'RESOLVE_DIP_VARIANCE', 'resolve a reading variance');
+    if (roleCheck) return roleCheck;
+    const variance = getSqlite().prepare('SELECT * FROM reading_variances WHERE id = ?').get(req.params.id) as any;
+    if (!variance) return res.status(404).json({ message: 'Reading variance not found.' });
+    if (variance.status === 'Resolved') return res.status(409).json({ message: 'Reading variance is already resolved.' });
+    const resolvedAt = new Date().toISOString();
+    const notes = String(req.body?.resolutionNotes || '').trim() || null;
+    getSqlite().prepare(`UPDATE reading_variances
+      SET status = 'Resolved', resolved_by = ?, resolved_at = ?, resolution_notes = ?
+      WHERE id = ?`).run(req.authUser.id, resolvedAt, notes, variance.id);
+    addAuditLog(req.authUser.id, req.authUser.name, req.authUser.role, 'DIP_VARIANCE_RESOLVED', 'Shifts', `Resolved ${variance.reading_type} variance ${variance.id} for shift ${variance.shift_id}; no inventory adjustment was made.${notes ? ` Notes: ${notes}` : ''}`);
+    res.json(getSqlite().prepare('SELECT * FROM reading_variances WHERE id = ?').get(variance.id));
+  });
+
+  // Reconciliations
+  app.get('/api/reconciliations', (req: any, res) => {
+    const actor = req.authUser as User | undefined;
+    if (!actor) return res.status(401).json({ message: 'Authentication is required to view reconciliations.' });
+    const canViewAll = hasPermission(actor, 'VIEW_THREE_WAY_LEDGER');
+    res.json(canViewAll ? reconciliations : reconciliations.filter((record) => record.staffId === actor.id));
+  });
+
+  app.post('/api/reconciliations', (req, res) => {
+    const {
+      shiftId,
+      staffId,
+      staffName,
+      cashCount,
+      pumpReadings,
+      tankDips,
+      actorUserId,
+      actorRole,
+    } = req.body;
+
+    const shift = shifts.find((s) => s.id === shiftId);
+    if (!shift) return res.status(404).json({ message: 'Shift not found' });
+
+    const actingUser = (req as any).authUser as User | undefined;
+    const isAdminOrManager = actingUser && hasPermission(actingUser, 'MANAGE_THREE_WAY_LEDGER');
+    const isOwnShift = actingUser && actingUser.id === shift.staffId;
+
+    if (!actingUser || (!isOwnShift && !isAdminOrManager)) {
+      return res.status(403).json({ message: 'Clock-out is restricted to the logged-in user or an admin/manager.' });
+    }
+
+    const notesSum =
+      (cashCount.notes1000 || 0) * 1000 +
+      (cashCount.notes500 || 0) * 500 +
+      (cashCount.notes200 || 0) * 200 +
+      (cashCount.notes100 || 0) * 100 +
+      (cashCount.notes50 || 0) * 50 +
+      (cashCount.coins || 0) +
+      (cashCount.mpesaDirect || 0) +
+      (cashCount.cardDirect || 0) +
+      (cashCount.creditDirect || 0);
+
+    const expectedCash = shift.totalExpectedCash;
+    const cashVariance = notesSum - expectedCash;
+
+    let totalPumpVarLiters = 0;
+    const processedPumps = (pumpReadings || []).map((p: any) => {
+      const meterSales = Math.max(0, p.closingMeter - p.openingMeter);
+      const varL = meterSales - p.posSalesLiters;
+      totalPumpVarLiters += Math.abs(varL);
+      return {
+        ...p,
+        meterSalesLiters: meterSales,
+        varianceLiters: varL,
+      };
+    });
+
+    let totalTankVarLiters = 0;
+    const processedTanks = (tankDips || []).map((t: any) => {
+      const calcUsage = Math.max(0, t.openingDip - t.closingDip);
+      const varL = calcUsage - t.actualSales;
+      totalTankVarLiters += Math.abs(varL);
+      return {
+        ...t,
+        calculatedUsage: calcUsage,
+        varianceLiters: varL,
+      };
+    });
+
+    let status: ThreeWayReconciliation['status'] = 'Auto-Approved';
+    const absCashVar = Math.abs(cashVariance);
+
+    if (absCashVar > 1000 || totalPumpVarLiters > 20 || totalTankVarLiters > 20) {
+      status = 'Pending Approval';
+    } else if (absCashVar > 200 || totalPumpVarLiters > 5 || totalTankVarLiters > 5) {
+      status = 'Warning';
+    }
+
+    const rec: ThreeWayReconciliation = {
+      id: 'rec-' + Date.now(),
+      shiftId: shift.id,
+      staffId: staffId || shift.staffId,
+      staffName: staffName || shift.staffName,
+      timestamp: new Date().toISOString(),
+      expectedCash,
+      cashCount,
+      totalActualCash: notesSum,
+      cashVariance,
+      pumpReadings: processedPumps,
+      totalPumpVarianceLiters: totalPumpVarLiters,
+      tankDips: processedTanks,
+      totalTankVarianceLiters: totalTankVarLiters,
+      status,
+    };
+
+    reconciliations.unshift(rec);
+
+    try {
+      const persistReconciliation = getSqlite().transaction(() => {
+        db.reconciliationQueries.create({
+          id: rec.id,
+          date: rec.timestamp.slice(0, 10),
+          shiftId: rec.shiftId,
+          staffId: rec.staffId,
+          staffName: rec.staffName,
+          tankDipBefore: processedTanks[0]?.openingDip ?? null,
+          tankDipAfter: processedTanks[0]?.closingDip ?? null,
+          tankExpectedLiters: processedTanks.reduce((sum, tank) => sum + Number(tank.actualSales ?? 0), 0),
+          tankActualLiters: processedTanks.reduce((sum, tank) => sum + Number(tank.calculatedUsage ?? 0), 0),
+          tankVariance: totalTankVarLiters,
+          pumpMeterBefore: processedPumps[0]?.openingMeter ?? null,
+          pumpMeterAfter: processedPumps[0]?.closingMeter ?? null,
+          pumpExpectedLiters: processedPumps.reduce((sum, pump) => sum + Number(pump.posSalesLiters ?? 0), 0),
+          pumpActualLiters: processedPumps.reduce((sum, pump) => sum + Number(pump.meterSalesLiters ?? 0), 0),
+          pumpVariance: totalPumpVarLiters,
+          cashExpected: expectedCash,
+          cashActual: notesSum,
+          cashVariance,
+          varianceNotes: JSON.stringify({ timestamp: rec.timestamp, cashCount, pumpReadings: processedPumps, tankDips: processedTanks }),
+          status,
+          approvedBy: null,
+          approvedByName: null,
+        } as any);
+
+        processedPumps.forEach((reading: any) => {
+          const pump = pumps.find((item) => item.id === reading.pumpId);
+          if (!pump) return;
+
+          pump.currentMeterReading = Number(reading.closingMeter);
+          pump.openingMeterReading = Number(reading.closingMeter);
+
+          db.pumpQueries.update(pump.id, {
+            currentMeterReading: pump.currentMeterReading,
+            openingMeterReading: pump.openingMeterReading,
+          } as any);
+
+          db.nozzleReadingQueries.create({
+            id: `reading-${Date.now()}-${pump.id}-close`,
+            nozzleId: pump.id,
+            pumpId: pump.physicalPumpId ?? null,
+            tankId: pump.tankId,
+            fuelProductId: pump.fuelProductId,
+            shiftId: shift.id,
+            transactionId: null,
+            previousReading: Number(reading.openingMeter),
+            quantityDispensed: Number(reading.meterSalesLiters),
+            currentReading: Number(reading.closingMeter),
+            readingType: 'Closing',
+            recordedBy: shift.staffId,
+            timestamp: rec.timestamp,
+          } as any);
+        });
+
+        processedTanks.forEach((dip: any) => {
+          const tank = tanks.find((item) => item.id === dip.tankId);
+          if (!tank) return;
+          tank.lastDipReading = Number(dip.closingDip);
+          tank.lastDipTime = rec.timestamp;
+          db.tankQueries.update(tank.id, {
+            lastDipReading: tank.lastDipReading,
+            lastDipTime: tank.lastDipTime,
+          } as any);
+        });
+      });
+
+      persistReconciliation();
+    } catch (error) {
+      reconciliations.shift();
+      console.error('Error saving reconciliation to database:', error);
+      return res.status(500).json({ message: 'Reconciliation could not be saved.' });
+    }
+
+    shift.endTime = new Date().toISOString();
+    shift.actualCashCount = notesSum;
+    shift.cashVariance = cashVariance;
+    shift.fuelVarianceLiters = totalPumpVarLiters;
+    shift.tankVarianceLiters = totalTankVarLiters;
+    shift.closingPumpReadings = processedPumps;
+    shift.closingTankDips = processedTanks;
+
+    if (status === 'Pending Approval' || status === 'Warning') {
+      shift.status = 'Pending Approval';
+      shift.approvalStatus = 'Pending';
+
+      const approvalItem: ManagerApproval = {
+        id: 'app-' + Date.now(),
+        timestamp: new Date().toISOString(),
+        shiftId: shift.id,
+        type: absCashVar > 1000 ? 'Cash Variance' : 'Fuel Discrepancy',
+        requestedBy: shift.staffName,
+        reason: `3-Way Reconciliation Flagged: Cash Var = KES ${cashVariance.toFixed(2)}, Pump Var = ${totalPumpVarLiters.toFixed(1)}L, Tank Var = ${totalTankVarLiters.toFixed(1)}L.`,
+        amountOrQty: `KES ${cashVariance.toFixed(2)} / ${totalPumpVarLiters.toFixed(1)}L`,
+        status: 'Pending',
+      };
+      approvals.unshift(approvalItem);
+
+      try {
+        const sqlite = getSqlite();
+        sqlite.prepare(`INSERT INTO manager_approvals (id, timestamp, shift_id, type, requested_by, reason, amount_or_qty, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending')`)
+          .run(approvalItem.id, approvalItem.timestamp, approvalItem.shiftId, approvalItem.type, approvalItem.requestedBy, approvalItem.reason, approvalItem.amountOrQty);
+      } catch (error) {
+        console.error('Error persisting approval:', error);
+      }
+    } else {
+      shift.status = 'Completed';
+      shift.approvalStatus = 'Approved';
+    }
+
+    const usr = users.find((u) => u.id === shift.staffId);
+    if (usr) usr.currentShiftId = null;
+
+    try {
+      db.shiftQueries.update(shift.id, {
+        endTime: shift.endTime,
+        status: shift.status,
+        closingCash: shift.actualCashCount ?? null,
+        closingPumpReadingsJson: JSON.stringify(processedPumps),
+        closingTankDipsJson: JSON.stringify(processedTanks),
+      } as any);
+      if (usr) db.userQueries.update(usr.id, { currentShiftId: null } as any);
+      getSqlite().prepare(`UPDATE shift_assignments
+        SET clock_out_time = ?, status = 'Completed'
+        WHERE clock_in_shift_id = ?`).run(shift.endTime, shift.id);
+    } catch (error) {
+      console.error('Error saving reconciled shift state to database:', error);
+      return res.status(500).json({ message: 'Reconciliation was recorded, but the shift could not be closed.' });
+    }
+
+    addAuditLog(
+      actingUser.id,
+      actingUser.name,
+      actingUser.role,
+      'SHIFT_CLOCK_OUT',
+      'Reconciliation',
+      `Completed shift clock-out reconciliation. Status: ${status}. Cash Variance: KES ${cashVariance.toFixed(2)}`,
+      status === 'Pending Approval' ? 'Warning' : 'Info'
+    );
+
+    res.json({ reconciliation: rec, shift });
+  });
+
+  // Approvals
+  app.get('/api/approvals', (req, res) => {
+    const actor = (req as any).authUser as User | undefined;
+    if (!actor) return res.status(401).json({ message: 'Authentication is required.' });
+    if (!isAdminRole(actor.role) && !hasPermission(actor, 'VIEW_APPROVALS')) {
+      return res.status(403).json({ message: 'Permission required: VIEW_APPROVALS.' });
+    }
+    res.json(approvals);
+  });
+
+  app.post('/api/approvals/resolve', (req, res) => {
+    const { approvalId, action, managerId, managerName, managerPin, notes } = req.body;
+    const actor = (req as any).authUser as User | undefined;
+    if (!actor) return res.status(401).json({ message: 'Authentication is required.' });
+    const mgr = getUserById(String(managerId));
+    if (!mgr || actor.id !== mgr.id || !verifyStoredPin(mgr.pin, managerPin).valid) {
+      return res.status(403).json({ message: 'Manager PIN verification failed or unauthorized role.' });
+    }
+    if (!isAdminRole(actor.role) && !hasPermission(actor, 'MANAGE_APPROVALS')) {
+      return res.status(403).json({ message: 'Permission required: MANAGE_APPROVALS.' });
+    }
+
+    const appItem = approvals.find((a) => a.id === approvalId) as any;
+    if (!appItem) return res.status(404).json({ message: 'Approval item not found' });
+
+    appItem.status = action === 'Approved' ? 'Approved' : 'Rejected';
+    appItem.managerId = mgr.id;
+    appItem.managerNotes = notes;
+
+    try {
+      const sqlite = getSqlite();
+      sqlite.prepare(`UPDATE manager_approvals SET status = ?, manager_id = ?, manager_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+        .run(appItem.status, mgr.id, notes, approvalId);
+    } catch (error) {
+      console.error('Error updating approval in database:', error);
+    }
+
+    if (appItem.shiftId) {
+      const shift = shifts.find((s) => s.id === appItem.shiftId) as any;
+      if (shift) {
+        shift.approvalStatus = action === 'Approved' ? 'Approved' : 'Rejected';
+        shift.status = action === 'Approved' ? 'Completed' : 'Flagged';
+        db.shiftQueries.update(shift.id, {
+          status: shift.status,
+          endTime: shift.endTime,
+          closingCash: shift.actualCashCount ?? null,
+        } as any);
+      }
+
+      const recIndex = reconciliations.findIndex((r) => r.shiftId === appItem.shiftId);
+      if (recIndex >= 0) {
+        reconciliations[recIndex].status = action === 'Approved' ? 'Approved' : 'Rejected';
+
+        try {
+          const sqlite = getSqlite();
+          sqlite.prepare('UPDATE reconciliations SET status = ?, approved_by = ?, approved_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE shift_id = ?')
+            .run(reconciliations[recIndex].status, mgr.id, mgr.name, appItem.shiftId);
+          reconciliations[recIndex].managerId = mgr.id;
+          reconciliations[recIndex].managerNotes = notes || undefined;
+        } catch (error) {
+          console.error('Error updating reconciliation status:', error);
+        }
+      }
+    }
+
+    addAuditLog(
+      mgr.id,
+      mgr.name,
+      mgr.role,
+      `APPROVAL_${action.toUpperCase()}`,
+      'Approvals',
+      `Manager ${mgr.name} ${action} item ${appItem.id} (${appItem.type}): ${notes}`
+    );
+
+    res.json(appItem);
+  });
+
+  // Audit Logs
+  app.get('/api/audit-logs', (req, res) => {
+    const roleCheck = requirePermission(req as any, res, 'VIEW_AUDIT_TRAIL', 'audit log access');
+    if (roleCheck) return roleCheck;
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 15)));
+    const search = String(req.query.search || '').trim();
+    const module = String(req.query.module || '').trim();
+    const severity = String(req.query.severity || '').trim();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (search) {
+      clauses.push('(action LIKE ? OR details LIKE ? OR user_name LIKE ? OR user_role LIKE ?)');
+      const pattern = `%${search}%`;
+      params.push(pattern, pattern, pattern, pattern);
+    }
+    if (module && module !== 'All') {
+      clauses.push('module = ?');
+      params.push(module);
+    }
+    if (severity && severity !== 'All') {
+      clauses.push('severity = ?');
+      params.push(severity);
+    }
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+    const sqlite = getSqlite();
+    const total = Number((sqlite.prepare(`SELECT COUNT(*) AS count FROM audit_logs${where}`).get(...params) as any).count || 0);
+    const records = sqlite.prepare(`SELECT * FROM audit_logs${where} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`)
+      .all(...params, pageSize, (page - 1) * pageSize)
+      .map((record: any) => ({
+        id: record.id,
+        timestamp: record.timestamp,
+        userId: record.user_id || '',
+        userName: record.user_name || 'System',
+        userRole: record.user_role || 'System',
+        action: record.action,
+        module: record.module,
+        details: record.details || '',
+        ipAddress: record.ip_address || '',
+        severity: record.severity || 'Info',
+      }));
+    res.json({ records, page, pageSize, total, totalPages: Math.ceil(total / pageSize) });
+  });
+
+  // --- VITE MIDDLEWARE SETUP ---
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        host: 'localhost',
+        port: VITE_HMR_PORT,
+        strictPort: true,
+        hmr: process.env.DISABLE_HMR === 'true'
+          ? false
+          : {
+              host: 'localhost',
+              port: VITE_HMR_PORT,
+            },
+      },
+      appType: 'spa',
+    });
+    viteDevServer = vite;
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(staticDir));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(staticDir, 'index.html'));
+    });
+  }
+
+  app.get('/api/system/sync-database', (req, res) => {
+    try {
+      const allData = db.getAllData() as any;
+      users = allData.users as User[];
+      products = allData.products as FuelProduct[];
+      tanks = allData.tanks as FuelTank[];
+      pumps = allData.pumps as PumpNozzle[];
+      shopItems = allData.shopItems as ShopItem[];
+      shifts = allData.shifts as ShiftSession[];
+      schedules = allData.schedules as ShiftSchedule[];
+      transactions = allData.transactions as Transaction[];
+      deliveries = allData.deliveries as FuelDelivery[];
+      approvals = allData.approvals as ManagerApproval[];
+      auditLogs = allData.auditLogs as AuditLog[];
+      stationSettings = allData.settings as StationSettings;
+      creditNotes = allData.creditNotes as CreditNote[];
+      customers = allData.customers as CustomerAccount[];
+      cashFlow = allData.cashFlow as CashFlowRecord[];
+      suppliers = allData.suppliers as SupplierAccount[];
+
+      res.json({
+        success: true,
+        message: 'Database synced successfully',
+        dataLoaded: {
+          users: users.length,
+          tanks: tanks.length,
+          products: products.length,
+          transactions: transactions.length,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({ error: 'Failed to sync database' });
+    }
+  });
+
+  await startup;
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : PORT;
+  console.log(`DT-FMS Server listening on http://127.0.0.1:${port}`);
+
+  return { port, close: closeServer };
+}
+
+const isDirectServerLaunch = Boolean(process.argv[1])
+  && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isDirectServerLaunch) {
+  startServer().catch((error) => {
+    console.error('Server startup error:', error);
+    process.exit(1);
+  });
+}
