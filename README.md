@@ -15,7 +15,7 @@ View your app in AI Studio: https://ai.studio/apps/773df1d2-1489-45eb-aa89-eda91
 
 1. Install dependencies:
    `npm install`
-2, Run Browser/backend dev:
+2. Run Browser/backend dev:
    `npm run dev`
 3. run elecron development:
    `npm run desktop:dev`
