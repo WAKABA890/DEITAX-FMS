@@ -42,7 +42,6 @@ import { StationSettings } from './components/StationSettings';
 import { AuditTrail } from './components/AuditTrail';
 import { Reports } from './components/Reports';
 import { ReceiptModal } from './components/ReceiptModal';
-import { OperationalDocumentPreview, ShiftReconciliationDocument } from './components/OperationalDocumentPreview';
 import { UserManagement } from './components/UserManagement';
 import { Fuel, AlertTriangle, LogOut, Moon, Sun } from 'lucide-react';
 import { canAccessModule } from './types';
@@ -111,7 +110,7 @@ export default function App() {
 
   // Modals
   const [activeReceiptTx, setActiveReceiptTx] = useState<Transaction | null>(null);
-  const [requestedReconciliationReprint, setRequestedReconciliationReprint] = useState<ThreeWayReconciliation | null>(null);
+  const [ledgerShiftId, setLedgerShiftId] = useState<string | null>(null);
   const [dipTankModal, setDipTankModal] = useState<FuelTank | null>(null);
   const [dipReadingInput, setDipReadingInput] = useState<number>(0);
 
@@ -895,9 +894,10 @@ export default function App() {
                 onCreateShiftPlan={handleCreateShiftPlan}
                 onAssignShiftPlanUser={handleAssignShiftPlanUser}
                 onRemoveShiftPlanUser={handleRemoveShiftPlanUser}
-                onReprintReconciliation={(reconciliation) => {
-                  setRequestedReconciliationReprint(reconciliation);
-                }}
+                onViewShiftReport={canAccessTab('reconciliation') ? (shiftId) => {
+                  setLedgerShiftId(shiftId);
+                  setActiveTab('reconciliation');
+                } : undefined}
               />
             )}
 
@@ -925,7 +925,7 @@ export default function App() {
             )}
 
             {activeTab === 'reconciliation' && (
-              <ReconciliationLedger reconciliations={reconciliations} shifts={shifts} />
+              <ReconciliationLedger reconciliations={reconciliations} shifts={shifts} selectedShiftId={ledgerShiftId} onClearSelectedShift={() => setLedgerShiftId(null)} />
             )}
 
             {activeTab === 'cashflow' && (
@@ -970,12 +970,8 @@ export default function App() {
                 creditNotes={creditNotes}
                 customers={customers}
                 deliveries={deliveries}
-                reconciliations={reconciliations}
-                shifts={shifts}
                 settings={settings}
                 currentUser={currentUser}
-                requestedReconciliationReprint={requestedReconciliationReprint}
-                onRequestedReconciliationHandled={() => setRequestedReconciliationReprint(null)}
                 onCreateCreditNote={handleCreateCreditNote}
                 onOpenReceipt={setActiveReceiptTx}
                 onSaveCustomer={handleSaveCustomer}
@@ -1052,21 +1048,6 @@ export default function App() {
             settings={settings}
             onClose={() => setActiveReceiptTx(null)}
           />
-        )}
-
-        {/* Reconciliation reports are available to staff from their own shift
-            history; do not route through the permission-protected Invoices tab. */}
-        {requestedReconciliationReprint && (
-          <OperationalDocumentPreview
-            fileName={`shift-reconciliation-${requestedReconciliationReprint.id}`}
-            onClose={() => setRequestedReconciliationReprint(null)}
-          >
-            <ShiftReconciliationDocument
-              reconciliation={requestedReconciliationReprint}
-              shift={shifts.find((shift) => shift.id === requestedReconciliationReprint.shiftId)}
-              settings={settings}
-            />
-          </OperationalDocumentPreview>
         )}
 
         {/* Quick Dashboard Dip Modal */}

@@ -58,7 +58,7 @@ interface ShiftManagementProps {
   onAssignShiftPlanUser?: (shiftPlanId: string, userId: string) => Promise<any>;
   onRemoveShiftPlanUser?: (shiftPlanId: string, userId: string) => Promise<any>;
   onDeleteShiftPlan?: (shiftPlanId: string) => Promise<any>;
-  onReprintReconciliation?: (reconciliation: ThreeWayReconciliation) => void;
+  onViewShiftReport?: (shiftId: string) => void;
 }
 
 type ModalState = {
@@ -131,7 +131,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
   onAssignShiftPlanUser,
   onRemoveShiftPlanUser,
   onDeleteShiftPlan,
-  onReprintReconciliation,
+  onViewShiftReport,
 }) => {
   const { hasPermission } = usePermissions(currentUser);
   const canManageShifts = hasPermission('CREATE_SHIFT') || hasPermission('ASSIGN_SHIFT_USERS') || hasPermission('REMOVE_SHIFT_USERS');
@@ -710,8 +710,8 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
                       </td>
                       <td className="p-3 text-right">
                         {reconciliation ? (
-                          <button type="button" onClick={() => onReprintReconciliation?.(reconciliation)} className="fms-btn fms-btn-secondary fms-btn-compact">
-                            <Printer className="h-3 w-3" /> Reprint Report
+                          <button type="button" onClick={() => onViewShiftReport?.(s.id)} disabled={!onViewShiftReport} title="View this shift in the 3-way ledger" className="fms-btn fms-btn-secondary fms-btn-compact">
+                            <Printer className="h-3 w-3" /> View shift report
                           </button>
                         ) : <span className="text-[10px] text-slate-500">No report</span>}
                       </td>

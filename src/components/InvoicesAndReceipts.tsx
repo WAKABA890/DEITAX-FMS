@@ -24,7 +24,6 @@ import {
   History,
   Clock,
   Truck,
-  Scale,
 } from 'lucide-react';
 import {
   Transaction,
@@ -33,23 +32,19 @@ import {
   User as UserType,
   CustomerAccount,
   FuelDelivery,
-  ThreeWayReconciliation,
-  ShiftSession,
 } from '../types';
 import { PaginationControls, usePagination } from './PaginationControls';
 import { printSelectedDocument } from '../utils/print-document';
 import { usePermissions } from '../hooks/usePermissions';
 import toast from 'react-hot-toast';
 import { AppDialog } from './AppDialog';
-import { FuelDeliveryDocument, OperationalDocumentPreview, ShiftReconciliationDocument } from './OperationalDocumentPreview';
+import { FuelDeliveryDocument, OperationalDocumentPreview } from './OperationalDocumentPreview';
 
 interface InvoicesAndReceiptsProps {
   transactions?: Transaction[];
   creditNotes?: CreditNote[];
   customers?: CustomerAccount[];
   deliveries?: FuelDelivery[];
-  reconciliations?: ThreeWayReconciliation[];
-  shifts?: ShiftSession[];
   stationSettings?: StationSettings;
   settings?: StationSettings;
   currentUser?: UserType;
@@ -59,8 +54,6 @@ interface InvoicesAndReceiptsProps {
   onSaveCustomer?: (data: any) => Promise<any>;
   onDeleteCustomer?: (customerId: string) => Promise<any>;
   onRecordDebtRepayment?: (data: any) => Promise<any>;
-  requestedReconciliationReprint?: ThreeWayReconciliation | null;
-  onRequestedReconciliationHandled?: () => void;
 }
 
 export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
@@ -68,8 +61,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
   creditNotes = [],
   customers = [],
   deliveries = [],
-  reconciliations = [],
-  shifts = [],
   stationSettings,
   settings,
   currentUser,
@@ -79,8 +70,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
   onSaveCustomer,
   onDeleteCustomer,
   onRecordDebtRepayment,
-  requestedReconciliationReprint,
-  onRequestedReconciliationHandled,
 }) => {
   // ✅ Granular permissions + composite canManageUsers fallback
   const {
@@ -104,31 +93,15 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
   const safeCreditNotes = Array.isArray(creditNotes) ? creditNotes : [];
   const safeCustomers = Array.isArray(customers) ? customers : [];
   const safeDeliveries = Array.isArray(deliveries) ? deliveries : [];
-  const safeReconciliations = Array.isArray(reconciliations) ? reconciliations : [];
-  const safeShifts = Array.isArray(shifts) ? shifts : [];
 
   const activeSettings = stationSettings || settings;
   const issueCreditNoteHandler = onIssueCreditNote || onCreateCreditNote;
 
-  const [activeSubTab, setActiveSubTab] = useState<'invoices' | 'customers' | 'credit-notes' | 'document-history' | 'delivery-records' | 'reconciliation-documents'>('invoices');
+  const [activeSubTab, setActiveSubTab] = useState<'invoices' | 'customers' | 'credit-notes' | 'document-history' | 'delivery-records'>('invoices');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDoc, setSelectedDoc] = useState<{ type: string; title: string; docNo: string; timestamp: string; customer?: string; details: any } | null>(null);
   const [creditNoteDocumentLock, setCreditNoteDocumentLock] = useState<{ type: 'receipt' | 'invoice'; docNo: string } | null>(null);
   const [printError, setPrintError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!requestedReconciliationReprint) return;
-    setActiveSubTab('reconciliation-documents');
-    setSelectedDoc({
-      type: 'Shift Reconciliation',
-      title: 'Shift Reconciliation Report',
-      docNo: requestedReconciliationReprint.id.toUpperCase(),
-      timestamp: requestedReconciliationReprint.timestamp,
-      customer: `Staff: ${requestedReconciliationReprint.staffName}`,
-      details: requestedReconciliationReprint,
-    });
-    onRequestedReconciliationHandled?.();
-  }, [requestedReconciliationReprint, onRequestedReconciliationHandled]);
 
   // Credit Note Modal State
   const [showCreditNoteModal, setShowCreditNoteModal] = useState(false);
@@ -940,7 +913,7 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
   // --- DOCUMENT HISTORY & PAGINATION (unchanged) ---
   const documentArchive: Array<{
     id: string;
-    type: 'Tax Invoice' | 'Receipt' | 'Credit Note' | 'Fuel Delivery' | 'Shift Reconciliation';
+    type: 'Tax Invoice' | 'Receipt' | 'Credit Note' | 'Fuel Delivery';
     docNo: string;
     timestamp: string;
     customer: string;
@@ -976,18 +949,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
       customer: `Supplier: ${del.supplierName}`,
       amount: del.totalCost,
       details: del,
-    })),
-    ...safeReconciliations.map((rec) => ({
-      id: rec.id,
-      type: 'Shift Reconciliation' as const,
-      docNo: rec.id.toUpperCase(),
-      timestamp: rec.timestamp,
-      customer: `Staff: ${rec.staffName}`,
-      amount: (() => {
-        const shift = safeShifts.find((item) => item.id === rec.shiftId);
-        return Number(shift?.totalFuelSales ?? 0) + Number(shift?.totalShopSales ?? 0);
-      })(),
-      details: rec,
     })),
   ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
@@ -1025,7 +986,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
 
   const filteredArchive = documentArchive.filter((doc) => {
     if (activeSubTab === 'delivery-records' && doc.type !== 'Fuel Delivery') return false;
-    if (activeSubTab === 'reconciliation-documents' && doc.type !== 'Shift Reconciliation') return false;
     const q = searchTerm.toLowerCase();
     const docNo = String(doc?.docNo ?? '').toLowerCase();
     const type = String(doc?.type ?? '').toLowerCase();
@@ -1122,17 +1082,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
           >
             <Truck className="w-3.5 h-3.5" />
             Delivery Records
-          </button>
-          <button
-            onClick={() => setActiveSubTab('reconciliation-documents')}
-            className={`px-3.5 py-2 rounded-lg font-bold transition-all flex items-center gap-1.5 ${
-              activeSubTab === 'reconciliation-documents'
-                ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/20'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Scale className="w-3.5 h-3.5" />
-            Shift Reconciliation Reports
           </button>
         </div>
       </div>
@@ -1536,16 +1485,16 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
       )}
 
       {/* TAB 4: DOCUMENT HISTORY & REPRINTING */}
-      {(activeSubTab === 'document-history' || activeSubTab === 'delivery-records' || activeSubTab === 'reconciliation-documents') && (
+      {(activeSubTab === 'document-history' || activeSubTab === 'delivery-records') && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
           <div className="flex justify-between items-center pb-3 border-b border-slate-800">
             <div>
               <h3 className="font-bold text-slate-100 text-base flex items-center gap-2">
                 <History className="w-5 h-5 text-emerald-400" />
-                {activeSubTab === 'delivery-records' ? 'Fuel Delivery Records' : activeSubTab === 'reconciliation-documents' ? 'Shift Reconciliation Reports' : 'Complete Document History & Instant Reprint Archive'}
+                {activeSubTab === 'delivery-records' ? 'Fuel Delivery Records' : 'Complete Document History & Instant Reprint Archive'}
               </h3>
               <p className="text-xs text-slate-400">
-                {activeSubTab === 'delivery-records' ? 'Saved fuel delivery records.' : activeSubTab === 'reconciliation-documents' ? 'Saved shift reconciliation reports.' : 'Permanent log of all generated Tax Invoices, Receipts, Credit Notes, Tanker Deliveries, and Shift Reconciliations.'}
+                {activeSubTab === 'delivery-records' ? 'Saved fuel delivery records.' : 'Permanent log of all generated Tax Invoices, Receipts, Credit Notes, and Tanker Deliveries.'}
               </p>
             </div>
           </div>
@@ -1581,8 +1530,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
                               ? 'bg-rose-500/10 text-rose-400 border border-rose-500/30'
                               : doc.type === 'Fuel Delivery'
                               ? 'bg-blue-500/10 text-blue-400 border border-blue-500/30'
-                              : doc.type === 'Shift Reconciliation'
-                              ? 'bg-purple-500/10 text-purple-400 border border-purple-500/30'
                               : 'bg-slate-800 text-slate-300'
                           }`}
                         >
@@ -2162,7 +2109,7 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
       )}
 
       {/* DOCUMENT REPRINT PREVIEW MODAL */}
-      {selectedDoc && !['Fuel Delivery', 'Shift Reconciliation'].includes(selectedDoc.type) && (
+      {selectedDoc && selectedDoc.type !== 'Fuel Delivery' && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-0">
           <div className="relative flex h-[90vh] w-[90vw] max-w-6xl overflow-hidden rounded-none border border-slate-700 bg-slate-800 shadow-2xl">
             <div className="w-[320px] bg-slate-800 p-4 text-slate-100 border-r border-slate-700">
@@ -2405,11 +2352,6 @@ export const InvoicesAndReceipts: React.FC<InvoicesAndReceiptsProps> = ({
         </OperationalDocumentPreview>
       )}
 
-      {selectedDoc?.type === 'Shift Reconciliation' && (
-        <OperationalDocumentPreview fileName={selectedDoc.docNo} onClose={() => setSelectedDoc(null)}>
-          <ShiftReconciliationDocument reconciliation={selectedDoc.details as ThreeWayReconciliation} shift={safeShifts.find((item) => item.id === (selectedDoc.details as ThreeWayReconciliation).shiftId)} settings={activeSettings} />
-        </OperationalDocumentPreview>
-      )}
     </div>
   );
 };

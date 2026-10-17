@@ -1,3 +1,4 @@
+import { readableApprovalReason } from '../utils/approval-reason';
 import React, { useEffect, useState } from 'react';
 import {
   ShieldCheck,
@@ -13,6 +14,7 @@ import {
 
 import { ManagerApproval, User } from '../types';
 import { usePermissions } from '../hooks/usePermissions';
+import { PaginationControls, usePagination } from './PaginationControls';
 
 interface ManagerApprovalsProps {
   approvals?: ManagerApproval[];
@@ -57,6 +59,8 @@ export const ManagerApprovals: React.FC<ManagerApprovalsProps> = ({
   const resolvedList = safeApprovals.filter(
     (approval) => String(approval?.status ?? '').toLowerCase() !== 'pending'
   );
+
+  const resolvedApprovalPagination = usePagination(resolvedList, resolvedList.map((approval) => approval.id).join('|'));
 
   // ==================================================
   // RESET / CLOSE DIALOG
@@ -251,20 +255,21 @@ export const ManagerApprovals: React.FC<ManagerApprovalsProps> = ({
                 key={app.id}
                 className="flex flex-col items-start justify-between gap-4 rounded-xl border border-slate-800 bg-slate-950 p-4 transition-colors hover:border-slate-700 md:flex-row md:items-center"
               >
-                <div className="min-w-0">
+                <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-bold text-slate-200">{app.type}</span>
                     <span className="rounded-md border border-rose-500/20 bg-rose-500/10 px-2 py-0.5 font-mono text-[10px] font-bold text-rose-300">
                       {app.amountOrQty}
                     </span>
                   </div>
-                  <p className="mt-2 text-xs leading-relaxed text-slate-400">{app.reason}</p>
+                  <p className="mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-300">{readableApprovalReason(app.reason)}</p>
                   <div className="mt-2 flex flex-wrap gap-x-2 gap-y-1 text-[10px] text-slate-500">
                     <span>
                       Requested by: <span className="text-slate-400">{app.requestedBy}</span>
                     </span>
                     <span className="hidden sm:inline">•</span>
                     <span>{app.timestamp ? new Date(app.timestamp).toLocaleString() : 'Unknown time'}</span>
+                    {app.shiftId && <><span className="hidden sm:inline">•</span><span>Shift: <span className="text-slate-400">{app.shiftId}</span></span></>}
                   </div>
                 </div>
                 <div className="flex w-full items-center gap-2 md:w-auto">
@@ -304,11 +309,13 @@ export const ManagerApprovals: React.FC<ManagerApprovalsProps> = ({
         {resolvedList.length === 0 ? (
           <div className="py-10 text-center text-xs text-slate-500">No historical approval records are available yet.</div>
         ) : (
-          <div className="overflow-x-auto rounded-xl border border-slate-800">
+          <div className="space-y-4">
+            <div className="overflow-x-auto rounded-xl border border-slate-800">
             <table className="w-full text-left text-xs font-mono text-slate-300">
               <thead className="border-b border-slate-800 bg-slate-950 text-[10px] uppercase tracking-wider text-slate-500">
                 <tr>
                   <th className="px-4 py-3">Type</th>
+                  <th className="px-4 py-3">Shift</th>
                   <th className="px-4 py-3">Requested By</th>
                   <th className="px-4 py-3">Amount / Qty</th>
                   <th className="px-4 py-3">Reason</th>
@@ -317,14 +324,15 @@ export const ManagerApprovals: React.FC<ManagerApprovalsProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
-                {resolvedList.map((app) => {
+                {resolvedApprovalPagination.pageItems.map((app) => {
                   const isApproved = String(app.status).toLowerCase() === 'approved';
                   return (
                     <tr key={app.id} className="transition-colors hover:bg-slate-950">
                       <td className="px-4 py-3 font-bold text-slate-200">{app.type}</td>
+                      <td className="px-4 py-3 font-mono text-slate-400">{app.shiftId || '—'}</td>
                       <td className="px-4 py-3 text-slate-400">{app.requestedBy}</td>
                       <td className="px-4 py-3 font-bold text-amber-400">{app.amountOrQty}</td>
-                      <td className="max-w-xs px-4 py-3 text-slate-400">{app.reason}</td>
+                      <td className="max-w-sm px-4 py-3 text-slate-400"><p className="max-h-64 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed">{readableApprovalReason(app.reason)}</p></td>
                       <td className="px-4 py-3 text-center">
                         <span
                           className={`inline-flex rounded-md border px-2 py-1 text-[10px] font-bold ${
@@ -336,12 +344,14 @@ export const ManagerApprovals: React.FC<ManagerApprovalsProps> = ({
                           {app.status}
                         </span>
                       </td>
-                      <td className="max-w-sm px-4 py-3 text-slate-400">{app.managerNotes || '-'}</td>
+                      <td className="max-w-sm whitespace-pre-wrap break-words px-4 py-3 text-slate-400">{app.managerNotes || '-'}</td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
+            </div>
+            <PaginationControls currentPage={resolvedApprovalPagination.currentPage} totalPages={resolvedApprovalPagination.totalPages} itemCount={resolvedList.length} onPageChange={resolvedApprovalPagination.setCurrentPage} />
           </div>
         )}
       </div>
@@ -406,7 +416,8 @@ export const ManagerApprovals: React.FC<ManagerApprovalsProps> = ({
                 </div>
                 <div className="mt-3 border-t border-slate-800 pt-3">
                   <div className="text-xs font-bold text-slate-300">{selectedApproval.type}</div>
-                  <div className="mt-1 text-xs leading-relaxed text-slate-500">{selectedApproval.reason}</div>
+                  {selectedApproval.shiftId && <p className="mt-1 break-words text-xs text-slate-400">Shift: {selectedApproval.shiftId}</p>}
+                  <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-300">{readableApprovalReason(selectedApproval.reason)}</div>
                 </div>
               </div>
 
